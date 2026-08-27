@@ -1418,8 +1418,10 @@ public final class LinkAttribution: @unchecked Sendable {
                     // 登录响应丢失恢复只保留 attributionId，后续先幂等确认登录。
                 }
             }
-            guard var registeredState = loadState(), registeredState.eventId == expectedEventId,
-                  registeredState.attributionId != nil else {
+            guard var registeredState = loadState(), registeredState.eventId == expectedEventId else {
+                throw CancellationError()
+            }
+            guard registeredState.attributionId != nil else {
                 throw LinkAttributionError.invalidArgument("installation must be registered before login confirmation")
             }
             if configuration.userProvidedEvidenceEnabled,
@@ -1428,11 +1430,16 @@ public final class LinkAttribution: @unchecked Sendable {
                     pendingEvidence,
                     expectedEventId: expectedEventId
                 )
+                // 证据入口将取消映射为 deferred；抛错式登录恢复仍须原样传播调用任务的取消。
+                try Task.checkCancellation()
+                // 证据请求期间可能被清理并建立新安装；成功或临时失败都不能让旧登录任务采用新代次。
+                guard let refreshedState = loadState(), refreshedState.eventId == expectedEventId else {
+                    throw CancellationError()
+                }
                 guard submission != .deferred else {
                     // 宿主业务登录已经完成；这里只延后平台登录事实，保持原 eventId/occurredAt 等待恢复。
                     throw LinkAttributionError.network("pending_user_evidence")
                 }
-                guard let refreshedState = loadState() else { throw LinkAttributionError.invalidResponse }
                 registeredState = refreshedState
             }
             guard let eventId = registeredState.loginEventId,
@@ -1440,7 +1447,7 @@ public final class LinkAttribution: @unchecked Sendable {
                 throw LinkAttributionError.invalidArgument("installation must be registered before login confirmation")
             }
             if let confirmation = registeredState.loginConfirmation { return confirmation }
-            guard let attemptedState = try mutateExistingState(expectedEventId: registeredState.eventId, { current in
+            guard try mutateExistingState(expectedEventId: expectedEventId, { current in
                 guard current.loginEventId == eventId else {
                     throw LinkAttributionError.invalidResponse
                 }
@@ -1448,22 +1455,21 @@ public final class LinkAttribution: @unchecked Sendable {
                     // 在真正触网前持久化发送尝试；仅凭“本地计划登录”不能合法化服务端提前 FINAL。
                     current.loginSubmissionAttemptedAt = now()
                 }
-            }) else {
-                throw LinkAttributionError.invalidResponse
+            }) != nil else {
+                throw CancellationError()
             }
-            registeredState = attemptedState
             let confirmation: LoginConfirmation = try await request(
                 path: "/v1/sdk/events/login-completed",
                 method: "POST",
                 body: LoginCompletedRequest(
-                    installationEventId: registeredState.eventId,
+                    installationEventId: expectedEventId,
                     eventId: eventId,
                     occurredAt: occurredAt,
                     reportedAt: now()
                 ),
                 idempotencyKey: eventId
             )
-            guard try mutateExistingState(expectedEventId: registeredState.eventId, { current in
+            guard try mutateExistingState(expectedEventId: expectedEventId, { current in
                 guard current.loginEventId == eventId else { return }
                 current.loginConfirmation = confirmation
                 current.loginConfirmationPermanentlyRejected = false
