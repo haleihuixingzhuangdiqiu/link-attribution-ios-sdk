@@ -4,7 +4,7 @@
 
 公开 Swift Package 仓库为 [haleihuixingzhuangdiqiu/link-attribution-ios-sdk](https://github.com/haleihuixingzhuangdiqiu/link-attribution-ios-sdk)。已发布 tag 不得移动或覆盖；任何行为修复都必须发布新 tag，并在匿名 SwiftPM 消费工程中重新解析验证。本 SDK 使用 [Apache License 2.0](./LICENSE)，归属声明见 [NOTICE](./NOTICE)。
 
-当前源码对应不可变发布候选 `0.6.3`。公开 tag 与源码同步、且匿名 consumer 验证通过后，宿主才可使用：
+当前源码对应已公开的不可变发布 `0.6.3`；tag `v0.6.3` 已通过无凭据匿名浅克隆、精确提交核对与 `swift test`。宿主使用：
 
 ```swift
 .package(url: "https://github.com/haleihuixingzhuangdiqiu/link-attribution-ios-sdk.git", exact: "0.6.3")
@@ -93,14 +93,13 @@ if let delivery = try sdk.pendingFinalDelivery(accountScope: localOpaqueAccountS
    let decisionId = delivery.result.decisionId {
     let finalMatchesVersion = delivery.result.decisionSequence
     let claimed = try await businessBackend.claimReferralAttribution(
-        deliveryId: delivery.deliveryId,
-        installInstanceId: delivery.result.attributionId,
+        attributionId: delivery.result.attributionId,
         decisionId: decisionId,
         finalMatchesVersion: finalMatchesVersion
     )
     // 只有 Server Key 验签、业务幂等处理完成并精确回显三个定位值后才 ack。
     if claimed.processed,
-       claimed.installInstanceId == delivery.result.attributionId,
+       claimed.attributionId == delivery.result.attributionId,
        claimed.decisionId == decisionId,
        claimed.finalMatchesVersion == finalMatchesVersion {
         try sdk.acknowledgeFinalDelivery(
@@ -115,7 +114,7 @@ if let delivery = try sdk.pendingFinalDelivery(accountScope: localOpaqueAccountS
 
 原登录 API、登录请求/响应 DTO、Token 签发和会话落库保持不变。登录成功后 App 才调用接入方业务后端的 `POST /api/v1/referral-attributions/bind`；这不是移动端直连归因平台。Bearer 当前会话决定 user/session，请求只能包含 canonical lowercase `installInstanceId + decisionId`。业务后端返回 `200`（已处理）或 `202`（已持久受理）并精确回显两个 ID，在自身事务中幂等生成 UUIDv4 `loginTransactionId` 与 outbox；App 不传 user、session、transaction、用户哈希或登录时间。bind 只建立可信登录关联，不代表 FINAL 已形成。
 
-后续业务 `claim` 的请求和成功响应都必须精确包含 `installInstanceId + decisionId + finalMatchesVersion`。业务后端使用 bind 时保存的登录绑定调用 Go SDK `ResolveFinal`，验签且幂等完成权益处理（空匹配只关闭待办）后 App 才 ack。版本不一致、superseded、202 处理中或回显不一致都不得 ack 或自动跟随另一 Decision。
+后续业务 `claim` 的请求和成功响应都必须精确包含 `attributionId + decisionId + finalMatchesVersion`，其中 `attributionId` 的值等于 SDK 的 `installInstanceId`。本地 `deliveryId` 只用于确认 SDK outbox，禁止发送给业务后端。业务后端使用 bind 时保存的登录绑定调用 Go SDK `ResolveFinal`，验签且幂等完成业务处理（空匹配只关闭待办）后 App 才 ack。版本不一致、superseded、202 处理中或回显不一致都不得 ack 或自动跟随另一 Decision。
 
 公开查询结果必须同时满足 `processState == .final`、`isFinal == true`，并通过 `outcome`、`finalMatches`、兼容镜像 `matches`、`matchCount` 和追加式 `decisionSequence` 的一致性校验；非终态按 `retryAfterMs` 有界轮询。多个达到门槛的分享码会以 `MULTIPLE_MATCHES` 一次返回，SDK 不替业务挑选其中一个。移动端 SDK Key 只允许查询当前项目/环境/Application 的脱敏结果，不是业务权益凭据；客户端可即时展示结果，但权益、邀请关系或返佣完全由业务系统负责。平台 SDK 不实现奖励、奖励回执或业务对账。
 
