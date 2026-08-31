@@ -52,15 +52,22 @@ do {
     // 归因本地缓存异常不回滚、不阻塞已经成功的业务登录。
 }
 
+// 首绑只使用登录前非 FINAL 引用；同账号重新认证优先复用稳定成功记录，FINAL 后不依赖再次预取。
+let freshBindReference = preparedAttribution.flatMap { result -> AttributionBindReference? in
+    guard result.processState != .final,
+          result.isFinal == false,
+          result.decisionSequence > 0,
+          let decisionId = result.decisionId else { return nil }
+    return AttributionBindReference(installInstanceId: result.attributionId, decisionId: decisionId)
+}
+
 // 登录成功后为独立 bind 冻结不透明鉴权代次；队列项不能跨退出、切号或新认证会话复用。
-if let preparedAttribution,
-   preparedAttribution.decisionSequence > 0,
-   let decisionId = preparedAttribution.decisionId,
-   let authSnapshot = sessionStore.currentAttributionAuthSnapshot {
+if let authSnapshot = sessionStore.currentAttributionAuthSnapshot,
+   let bindReference = bindStore.stableReference(for: authSnapshot.accountScope) ?? freshBindReference {
     bindRetryQueue.persist(
         AttributionBindTask(
-            installInstanceId: preparedAttribution.attributionId,
-            decisionId: decisionId,
+            installInstanceId: bindReference.installInstanceId,
+            decisionId: bindReference.decisionId,
             accountScope: authSnapshot.accountScope,
             authGeneration: authSnapshot.generation,
             sessionNonce: authSnapshot.sessionNonce
@@ -85,9 +92,13 @@ Task {
     }
 }
 
-// 在取出待办时冻结账号和不透明鉴权代次；即使同账号重新登录也视为新会话。
-if let claimAuthSnapshot = sessionStore.currentAttributionAuthSnapshot,
+// 只能恢复“本安装已成功 bind”时持久化的不透明鉴权标识，不能在 FINAL 到达时改采当前会话。
+if let currentAuthIdentity = sessionStore.currentAttributionAuthIdentity,
+   let completedBind = bindStore.completedSessionBinding(matching: currentAuthIdentity),
+   // 快照仅在当前账号/generation/nonce 与原 bind 完全一致时生成；不透明标识不含持久 Bearer。
+   let claimAuthSnapshot = sessionStore.frozenAttributionSession(matching: completedBind.authIdentity),
    let delivery = try sdk.pendingFinalDelivery(accountScope: claimAuthSnapshot.accountScope),
+   delivery.result.attributionId == completedBind.installInstanceId,
    let decisionId = delivery.result.decisionId {
     let finalMatchesVersion = delivery.result.decisionSequence
     // forFrozenSession 只冻结本地 Authorization/generation，不给 JSON Body 增加字段，也不做透明 refresh/replay。
@@ -101,6 +112,7 @@ if let claimAuthSnapshot = sessionStore.currentAttributionAuthSnapshot,
        claimed.decisionId == decisionId,
        claimed.finalMatchesVersion == finalMatchesVersion,
        sessionStore.isCurrentAttributionAuthSnapshot(claimAuthSnapshot),
+       bindStore.isCurrent(completedBind),
        claimed.isExactTerminal(for: delivery.result) {
         try sdk.acknowledgeFinalDelivery(
             deliveryId: delivery.deliveryId,
@@ -112,13 +124,15 @@ if let claimAuthSnapshot = sessionStore.currentAttributionAuthSnapshot,
 
 ## 独立 bind 与 FINAL claim 契约
 
-原登录 API、登录请求/响应 DTO、Token 签发和会话落库保持不变。登录成功后 App 才调用接入方业务后端的 `POST /api/v1/referral-attributions/bind`；这不是移动端直连归因平台。Bearer 当前会话决定 user/session，请求只能包含 canonical lowercase `installInstanceId + decisionId`。业务后端返回 `200`（已处理）或 `202`（已持久受理）并精确回显两个 ID，在自身事务中幂等生成 UUIDv4 `loginTransactionId` 与 outbox；App 不传 user、session、transaction、用户哈希或登录时间。bind 只建立可信登录关联，不代表 FINAL 已形成。
+原登录 API、登录请求/响应 DTO、Token 签发和会话落库保持不变。登录成功后 App 才调用接入方业务后端的 `POST /api/v1/referral-attributions/bind`；这不是移动端直连归因平台。Bearer 当前会话决定 user/session，请求只能包含 canonical lowercase `installInstanceId + decisionId`。只有首个 receiver 绑定该安装时，业务后端才在一个事务内生成 UUIDv4 `loginTransactionId`、稳定安装绑定、当前 session receipt 与 confirm outbox；同 receiver 新 session 精确复用首绑两个 ID，只新增 receipt 并复用稳定平台绑定，不再次 confirm-login。成功返回 `200/202` 并精确回显两个 ID；App 不传 user、session、transaction、用户哈希或登录时间。bind 只建立当前会话的可信调用授权，不代表 FINAL 已形成。
 
 bind worker 每次请求前必须重新核对账号、`authGeneration` 与 `sessionNonce`，只在 HTTP 200/202、业务信封成功且两个 ID 逐字回显时结束任务。401/403 不得透明刷新 Token 或重放旧项；退出、切号或新认证会话后旧项永久失效，只能由当前代次新建任务。网络、超时和 5xx 可在同一冻结代次内持久退避；任何失败都不得回滚或注销已经成功的登录。
 
 后续业务 `claim` 的请求和成功响应都必须精确包含 `attributionId + decisionId + finalMatchesVersion`，其中 `attributionId` 的值等于 SDK 的 `installInstanceId`。本地 `deliveryId` 只用于确认 SDK outbox，禁止发送给业务后端。业务后端使用 bind 时保存的登录绑定调用 Go SDK `ResolveFinal`，验签且幂等完成业务处理（空匹配只关闭待办）后 App 才 ack。`isExactTerminal` 必须实现固定矩阵：匹配型 FINAL 只接受完整非空 `APPLIED` 或空 `REJECTED`；`NO_MATCH` 只接受空 `NO_MATCH`；`UNRESOLVED/RISK_BLOCKED/EXPIRED` 只接受空 `REJECTED`；`PENDING`、版本不一致、superseded、回显/Match 不一致都不得 ack 或自动跟随另一 Decision。
 
-claim task 与 bind 使用同一账号、`authGeneration`、`sessionNonce` 隔离。请求前和响应后都必须复核冻结代次，Authorization 也从该快照固定读取；401/403 不刷新、不重放，退出、切号或同账号重新登录都会让旧任务失效。`isExactTerminal` 只校验业务响应矩阵，不能替代鉴权代次复核。
+首绑成功后，宿主同时持久化稳定 `installInstanceId + supplied decisionId + accountScope`（不含 Token）与当前 generation/nonce 的成功 bind-session receipt。同账号重新认证时，旧 receipt 永久失效；当前代次使用稳定记录中的原始两个 ID 新建独立 bind task，业务后端只新增 session receipt，不再次确认平台登录。不同账号不得复用稳定记录。
+
+claim task 必须从当前代次已成功 bind 的 session receipt 派生并复用它的账号、`authGeneration`、`sessionNonce`，不能在 FINAL 到达时按“当前会话”新建关联。请求前从该标识恢复同代次的临时 Authorization 快照，响应后再次复核当前会话和成功 bind receipt；401/403 不刷新、不重放，退出、切号或同账号重新登录都会让旧任务失效。持久记录只保存不透明代次标识，不保存 Bearer；`isExactTerminal` 只校验业务响应矩阵，不能替代鉴权代次复核。
 
 公开查询结果必须同时满足 `processState == .final`、`isFinal == true`，并通过 `outcome`、`finalMatches`、兼容镜像 `matches`、`matchCount` 和追加式 `decisionSequence` 的一致性校验；非终态按 `retryAfterMs` 有界轮询。多个达到门槛的分享码会以 `MULTIPLE_MATCHES` 一次返回，SDK 不替业务挑选其中一个。移动端 SDK Key 只允许查询当前项目/环境/Application 的脱敏结果，不是业务权益凭据；客户端可即时展示结果，但权益、邀请关系或返佣完全由业务系统负责。平台 SDK 不实现奖励、奖励回执或业务对账。
 
@@ -133,7 +147,7 @@ claim task 与 bind 使用同一账号、`authGeneration`、`sessionNonce` 隔�
 - 只有网络、超时、HTTP 408/425/429/5xx 自动重试。鉴权、参数、契约和普通 409 属于永久失败，自动恢复会跨进程停止；修复配置或升级 SDK 后才能显式调用 `resetAutomaticRecovery()`。
 - `pendingFinalDelivery(accountScope:)` 返回本地原子绑定同一账号、由业务后端 Server Key 确认后在平台形成、且尚未 ack 的全部合法 FINAL。`deliveryId` 由 `attributionId + decisionSequence` 稳定生成，重启后不丢失；`MATCHED/MULTIPLE_MATCHES` 携带冻结匹配，`NO_MATCH/UNRESOLVED/RISK_BLOCKED/EXPIRED` 携带空 `finalMatches`，同样必须可靠 claim 以关闭待办，但绝不能据此发放权益。
 - `AttributionResult.attributionId` 是安装实例定位值，即 Server Key 契约的 `installInstanceId`；`decisionId` 是当前精确 Decision，二者都是 UUID 且不得互换。Decision 尚未创建时 `decisionId` 为空；一旦 `decisionSequence > 0`，网络响应必须携带它。旧缓存缺失 `decisionId` 的业务 FINAL 不会进入 outbox，也不能提交给业务后端。
-- `resolveInstallation`、`getAttribution` 和 `waitForAttribution` 遇到含业务匹配的 FINAL 时抛出稳定的 `businessDeliveryRequired`；空匹配 FINAL 可返回脱敏诊断结果。`resumePendingAttribution` 对含业务匹配的 FINAL 返回 `.final` 且不附带结果，对空匹配 FINAL 可附带诊断结果；两类结果都必须从账号绑定的 `pendingFinalDelivery` 完成 claim/ack，避免旧查询入口绕过账号边界。
+- `resolveInstallation`、`getAttribution` 和 `waitForAttribution` 遇到含业务匹配的 FINAL 时抛出稳定的 `businessDeliveryRequired`；空匹配 FINAL 可返回脱敏诊断结果。`resumePendingAttribution` 对含业务匹配的 FINAL 返回 `.final` 且不附带结果，对空匹配 FINAL 可附带诊断结果。只有本地 authenticated binding 建立后形成的两类 FINAL 才进入账号绑定的 `pendingFinalDelivery` 并完成 claim/ack；绑定前匹配型 FINAL 失败关闭，绑定前空 FINAL 只诊断并持久抑制，均不得事后认领。
 - `accountScope` 仅存本机并且首次绑定后禁止换绑；应由宿主把内部账号 ID 转成不可逆、非明文、至少 16 字符的稳定作用域。账号绑定前形成的任何可交付 FINAL 都会持久抑制，不允许事后认领给任意账号；历史移动端确认也不能替代这一绑定。
 - FINAL Decision/Match 是不可变历史。用户明确提交的主动证据在本机已有可信登录绑定时仍可于资格窗内持久上报，平台再独立校验 Server Key 登录链并进入 reconciliation；SDK 保留原 FINAL/outbox，不把对账产生的新 Decision 直接交给移动端、回滚或重复发放权益。未绑定、历史越权 FINAL 或普通后台流程仍不得在终态后自动补造证据。
 - `apiBaseURL` 必须是纯 HTTP(S) origin，不能带业务路径、userinfo、query 或 fragment；非 localhost 必须 HTTPS。SDK 禁止 HTTP 重定向并校验最终响应仍为配置的同 origin；归因 GET 强制绕过本地 URL 缓存并发送 `no-store`，避免旧决策或 SDK Key 被重定向、缓存复用。
