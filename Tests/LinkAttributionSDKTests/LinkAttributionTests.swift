@@ -19,6 +19,20 @@ final class LinkAttributionTests: XCTestCase {
         super.tearDown()
     }
 
+    func testScreenSignalUsesOnlyFixedLowEntropyBucket() throws {
+        XCTAssertNil(LinkAttribution.screenBucketForWidth(0))
+        XCTAssertEqual(LinkAttribution.screenBucketForWidth(390), .compact)
+        XCTAssertEqual(LinkAttribution.screenBucketForWidth(600), .medium)
+        XCTAssertEqual(LinkAttribution.screenBucketForWidth(840), .expanded)
+        XCTAssertEqual(LinkAttribution.screenBucketForWidth(1_200), .large)
+
+        let encoded = try JSONEncoder().encode(ClientSignals(screenBucket: .compact))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(object["screenBucket"] as? String, "COMPACT")
+        XCTAssertNil(object["screenWidth"])
+        XCTAssertNil(object["screenHeight"])
+    }
+
     func testUniversalLinkResolvesCanonicalPayload() async throws {
         MockURLProtocol.handler = { request in
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Key"), "ios-key")
@@ -289,6 +303,7 @@ final class LinkAttributionTests: XCTestCase {
             #"{"attributionId":"00000000-0000-4000-8000-000000000201","processState":"FINAL","isFinal":true,"outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#,
             #"{"attributionId":"00000000-0000-4000-8000-000000000201","processState":"PROVISIONAL","isFinal":false,"status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":-1,"finalMatches":[]}"#,
             #"{"attributionId":"00000000-0000-4000-8000-000000000201","processState":"PROVISIONAL","isFinal":false,"status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#,
+            #"{"attributionId":"00000000-0000-4000-8000-000000000201","decisionId":"10000000-0000-4000-8000-000000000201","processState":"PROVISIONAL","isFinal":false,"outcome":null,"status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":null,"retryAfterMs":1000,"finalMatches":[],"matches":[],"matchCount":0}"#,
         ]
 
         for json in invalidResponses {
@@ -296,17 +311,115 @@ final class LinkAttributionTests: XCTestCase {
         }
     }
 
+    func testSequenceZeroRequiresDecisionIdToBeAbsentRatherThanNull() throws {
+        let missingDecisionId = #"{"attributionId":"00000000-0000-4000-8000-000000000201","processState":"PROVISIONAL","isFinal":false,"outcome":null,"status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":null,"retryAfterMs":1000,"finalMatches":[],"matches":[],"matchCount":0}"#
+        let nullDecisionId = missingDecisionId.replacingOccurrences(
+            of: #""processState""#,
+            with: #""decisionId":null,"processState""#
+        )
+
+        XCTAssertNoThrow(try JSONDecoder().decode(AttributionResult.self, from: Data(missingDecisionId.utf8)))
+        XCTAssertThrowsError(try JSONDecoder().decode(AttributionResult.self, from: Data(nullDecisionId.utf8)))
+    }
+
+    func testWireStrictlyValidatesRfc3339CalendarTimeAndOffset() throws {
+        func payload(timestamp: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "attributionId": "00000000-0000-4000-8000-000000000201",
+                "processState": "PROVISIONAL",
+                "isFinal": false,
+                "outcome": NSNull(),
+                "status": "PENDING",
+                "resolverType": "IOS_PROBABILISTIC_INSTALL",
+                "decisionSequence": 0,
+                "occurredAt": timestamp,
+                "reportedAt": timestamp,
+                "finalizedAt": NSNull(),
+                "retryAfterMs": 1_000,
+                "finalMatches": [],
+                "matches": [],
+                "matchCount": 0,
+            ])
+        }
+
+        let valid = [
+            "2024-02-29T23:59:59Z",
+            "2026-08-24T08:00:01.1-07:30",
+            "2026-08-24T08:00:01.123456789+23:59",
+        ]
+        for timestamp in valid {
+            XCTAssertNoThrow(try JSONDecoder().decode(AttributionResult.self, from: payload(timestamp: timestamp)), timestamp)
+        }
+
+        let invalid = [
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:00:00+24:00",
+            "2026-01-01T00:00:00+25:00",
+            "2026-01-01T00:00:00+23:60",
+            "2026-01-01T00:00:00.1234567890Z",
+        ]
+        for timestamp in invalid {
+            XCTAssertThrowsError(try JSONDecoder().decode(AttributionResult.self, from: payload(timestamp: timestamp)), timestamp)
+        }
+
+        func finalPayload(attributedAt: String) throws -> Data {
+            let match: [String: Any] = [
+                "linkId": "00000000-0000-4000-8000-000000000301",
+                "ruleKey": "icard_share",
+                "externalIdentifier": "share-123",
+                "confidenceBand": "HIGH",
+                "attributedAt": attributedAt,
+            ]
+            return try JSONSerialization.data(withJSONObject: [
+                "attributionId": "00000000-0000-4000-8000-000000000201",
+                "decisionId": "10000000-0000-4000-8000-000000000201",
+                "processState": "FINAL",
+                "isFinal": true,
+                "outcome": "MATCHED",
+                "status": "PROBABILISTIC_MATCH",
+                "resolverType": "IOS_PROBABILISTIC_INSTALL",
+                "decisionSequence": 1,
+                "occurredAt": "2026-08-24T08:00:00Z",
+                "reportedAt": "2026-08-24T08:00:01Z",
+                "finalizedAt": "2026-08-24T08:00:01Z",
+                "retryAfterMs": 0,
+                "finalMatches": [match],
+                "matches": [match],
+                "matchCount": 1,
+            ])
+        }
+
+        XCTAssertNoThrow(
+            try JSONDecoder().decode(
+                AttributionResult.self,
+                from: finalPayload(attributedAt: "2024-02-29T23:59:59.123456789+08:00")
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                AttributionResult.self,
+                from: finalPayload(attributedAt: "2026-02-29T00:00:00Z")
+            )
+        )
+    }
+
     func testWireRequiresBusinessIdentityAndRejectsInvalidUUIDs() throws {
-        let valid = #"{"attributionId":"00000000-0000-4000-8000-000000000221","processState":"FINAL","isFinal":true,"outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"icard_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"icard_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":1,"navigationSessionId":"00000000-0000-4000-8000-000000000421"}"#
+        let valid = #"{"attributionId":"00000000-0000-4000-8000-000000000221","decisionId":"10000000-0000-4000-8000-000000000221","processState":"FINAL","isFinal":true,"outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"icard_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"icard_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":1,"navigationSessionId":"00000000-0000-4000-8000-000000000421"}"#
 
         let result = try JSONDecoder().decode(AttributionResult.self, from: Data(valid.utf8))
         XCTAssertEqual(result.finalMatches.first?.ruleKey, "icard_share")
         XCTAssertEqual(result.finalMatches.first?.externalIdentifier, "share-123")
+        XCTAssertEqual(result.attributionId, "00000000-0000-4000-8000-000000000221")
+        XCTAssertEqual(result.decisionId, "10000000-0000-4000-8000-000000000221")
 
         let invalidResponses = [
             valid.replacingOccurrences(of: "00000000-0000-4000-8000-000000000221", with: "invalid-attribution-id"),
             valid.replacingOccurrences(of: "00000000-0000-4000-8000-000000000321", with: "invalid-link-id"),
             valid.replacingOccurrences(of: "00000000-0000-4000-8000-000000000421", with: "invalid-navigation-id"),
+            valid.replacingOccurrences(of: "10000000-0000-4000-8000-000000000221", with: "invalid-decision-id"),
+            valid.replacingOccurrences(of: #""decisionId":"10000000-0000-4000-8000-000000000221","#, with: ""),
             valid.replacingOccurrences(of: ",\"ruleKey\":\"icard_share\"", with: ""),
             valid.replacingOccurrences(of: ",\"externalIdentifier\":\"share-123\"", with: ""),
             valid.replacingOccurrences(of: "\"ruleKey\":\"icard_share\"", with: "\"ruleKey\":\"   \""),
@@ -330,6 +443,7 @@ final class LinkAttributionTests: XCTestCase {
             }
             return try JSONSerialization.data(withJSONObject: [
                 "attributionId": "00000000-0000-4000-8000-000000000221",
+                "decisionId": "10000000-0000-4000-8000-000000000221",
                 "processState": "FINAL",
                 "isFinal": true,
                 "outcome": "MULTIPLE_MATCHES",
@@ -350,20 +464,7 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(AttributionResult.self, from: payload(matchCount: 101)))
     }
 
-    func testLoginConfirmationRejectsUntrustedSuccessPayload() throws {
-        let invalidResponses = [
-            #"{"confirmationId":"not-a-uuid","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z"}"#,
-            #"{"confirmationId":"00000000-0000-4000-8000-000000000109","status":"IGNORED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z"}"#,
-            #"{"confirmationId":"00000000-0000-4000-8000-000000000109","status":"RECORDED","source":"UNKNOWN","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z"}"#,
-            #"{"confirmationId":"00000000-0000-4000-8000-000000000109","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"not-a-date","reportedAt":"2026-08-24T08:00:01Z"}"#,
-        ]
-
-        for json in invalidResponses {
-            XCTAssertThrowsError(try JSONDecoder().decode(LoginConfirmation.self, from: Data(json.utf8)), json)
-        }
-    }
-
-    func testConsumableFinalIsRejectedUntilLoginConfirmationIsPersisted() async throws {
+    func testConsumableFinalIsRejectedUntilLocalAccountBindingIsPersisted() async throws {
         MockURLProtocol.handler = { request in
             Self.response(
                 request,
@@ -374,7 +475,7 @@ final class LinkAttributionTests: XCTestCase {
 
         do {
             _ = try await sdk.resolveInstallation()
-            XCTFail("登录确认前不得交付可消费 FINAL")
+            XCTFail("本地账号未原子绑定时不得交付可消费 FINAL")
         } catch let error as LinkAttributionError {
             XCTAssertEqual(error, .invalidResponse)
         }
@@ -524,7 +625,7 @@ final class LinkAttributionTests: XCTestCase {
         _ = try await migrated.getAttribution(attributionId: attributionId)
         let migratedData = try XCTUnwrap(defaults.data(forKey: try currentInstallationStorageKey()))
         let migratedObject = try JSONSerialization.jsonObject(with: migratedData) as! [String: Any]
-        XCTAssertEqual(migratedObject["storageVersion"] as? Int, 3)
+        XCTAssertEqual(migratedObject["storageVersion"] as? Int, 4)
         XCTAssertEqual(migratedObject["eventId"] as? String, completedEventId)
         XCTAssertEqual(migratedObject["installationAppVersion"] as? String, "2.11.0")
         XCTAssertEqual(migratedObject["installationPlatform"] as? String, "IOS")
@@ -745,7 +846,7 @@ final class LinkAttributionTests: XCTestCase {
     func testMultipleMatchesExposeOnlySafeBusinessDelivery() async throws {
         let result = try JSONDecoder().decode(
             AttributionResult.self,
-            from: Data(#"{"attributionId":"00000000-0000-4000-8000-000000000206","processState":"FINAL","isFinal":true,"outcome":"MULTIPLE_MATCHES","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:02Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"icard_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"icard_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"icard_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"icard_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":2,"linkId":"ignored-legacy","route":"/ignored-legacy"}"#.utf8)
+            from: Data(#"{"attributionId":"00000000-0000-4000-8000-000000000206","decisionId":"10000000-0000-4000-8000-000000000206","processState":"FINAL","isFinal":true,"outcome":"MULTIPLE_MATCHES","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:02Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"icard_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"icard_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"icard_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"icard_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":2,"linkId":"ignored-legacy","route":"/ignored-legacy"}"#.utf8)
         )
 
         XCTAssertEqual(result.finalMatches.map(\.externalIdentifier), ["share-1", "share-2"])
@@ -773,59 +874,6 @@ final class LinkAttributionTests: XCTestCase {
         let rotated = try makeSdk(sdkKey: "ios-rotated-key")
         _ = try await rotated.resolveInstallation()
         XCTAssertEqual(count, 1)
-    }
-
-    func testSdkKeyRotationRecoversPermanentLoginFailureWithSameFact() async throws {
-        let attributionId = "00000000-0000-4000-8000-000000000261"
-        let accountScope = "local_scope_000261"
-        var loginPayloads: [[String: Any]] = []
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000261","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":3,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                loginPayloads.append(payload)
-                if request.value(forHTTPHeaderField: "X-SDK-Key") == "old-ios-key" {
-                    return Self.response(request, status: 401, json: #"{"error":"rotated"}"#)
-                }
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000161","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:02Z"}"#
-                )
-            case "/v1/sdk/attributions/\(attributionId)":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000261","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":4,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:03Z","finalizedAt":"2026-08-24T08:01:03Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000361","ruleKey":"icard_share","externalIdentifier":"rotated-key-share","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:01:03Z"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let oldSdk = try makeSdk(sdkKey: "old-ios-key")
-        try oldSdk.recordAuthenticatedLogin(accountScope: accountScope)
-        do {
-            _ = try await oldSdk.trackLoginCompleted()
-            XCTFail("旧 Key 应被永久拒绝")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .http(status: 401))
-        }
-
-        try await Task.sleep(nanoseconds: 5_000_000)
-        let newSdk = try makeSdk(sdkKey: "new-ios-key")
-        let outcome = try await newSdk.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-
-        XCTAssertEqual(outcome.phase, .final)
-        XCTAssertNil(outcome.result)
-        XCTAssertEqual(try newSdk.pendingFinalDelivery(accountScope: accountScope)?.result.finalMatches.first?.externalIdentifier, "rotated-key-share")
-        XCTAssertEqual(loginPayloads.count, 2)
-        XCTAssertEqual(loginPayloads[0]["eventId"] as? String, loginPayloads[1]["eventId"] as? String)
-        XCTAssertEqual(loginPayloads[0]["occurredAt"] as? String, loginPayloads[1]["occurredAt"] as? String)
-        XCTAssertNotEqual(loginPayloads[0]["reportedAt"] as? String, loginPayloads[1]["reportedAt"] as? String)
     }
 
     func testPendingInstallationCanBePolledAndTerminalResultIsCached() async throws {
@@ -908,516 +956,7 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertEqual(foreignGetCount, 0, "外部 attributionId 必须在触网前 fail-closed")
     }
 
-    func testLoginCompletedBindsInstallationAndCachesServerTimeWithoutIdentityData() async throws {
-        var loginRequestCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000208","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#)
-            case "/v1/sdk/events/login-completed":
-                loginRequestCount += 1
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                let installationEventId = try XCTUnwrap(payload["installationEventId"] as? String)
-                let eventId = try XCTUnwrap(payload["eventId"] as? String)
-                XCTAssertFalse(installationEventId.isEmpty)
-                XCTAssertFalse(eventId.isEmpty)
-                XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), eventId)
-                XCTAssertEqual(Set(payload.keys), ["installationEventId", "eventId", "occurredAt", "reportedAt"])
-                XCTAssertNotNil(payload["occurredAt"])
-                XCTAssertNotNil(payload["reportedAt"])
-                XCTAssertNil(payload["account"])
-                XCTAssertNil(payload["token"])
-                XCTAssertNil(payload["userId"])
-                XCTAssertNil(payload["signals"])
-                return Self.response(request, status: 201, json: #"{"confirmationId":"00000000-0000-4000-8000-000000000101","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-
-        let first = try await sdk.trackLoginCompleted()
-        let second = try await sdk.trackLoginCompleted()
-
-        XCTAssertEqual(first, second)
-        XCTAssertEqual(first.occurredAt, "2026-08-24T08:00:00Z")
-        XCTAssertEqual(first.reportedAt, "2026-08-24T08:00:01Z")
-        XCTAssertEqual(loginRequestCount, 1)
-    }
-
-    func testLoginConfirmationWaitsForHigherDecisionAfterPreLoginProvisional() async throws {
-        let attributionId = "00000000-0000-4000-8000-000000000252"
-        let accountScope = "local_scope_000252"
-        var attributionGetCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000252","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":7,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000152","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            case "/v1/sdk/attributions/\(attributionId)":
-                attributionGetCount += 1
-                if attributionGetCount <= 2 {
-                    return Self.response(
-                        request,
-                        json: #"{"attributionId":"00000000-0000-4000-8000-000000000252","processState":"SETTLING","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":7,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:02Z","retryAfterMs":0,"finalMatches":[]}"#
-                    )
-                }
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000252","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":8,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:03Z","finalizedAt":"2026-08-24T08:01:03Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000353","ruleKey":"icard_share","externalIdentifier":"post-login-share","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:01:03Z"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-
-        let provisional = try await sdk.resolveInstallation()
-        XCTAssertEqual(provisional.decisionSequence, 7)
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-        _ = try await sdk.trackLoginCompleted()
-        do {
-            _ = try await sdk.waitForAttribution(attributionId: attributionId, timeout: 1, interval: 0.01)
-            XCTFail("可消费 FINAL 不得从旧轮询入口暴露")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-
-        XCTAssertEqual(attributionGetCount, 3, "门槛前旧 provisional 可重复到达，但只能等待更高追加决策")
-        let delivery = try XCTUnwrap(sdk.pendingFinalDelivery(accountScope: accountScope))
-        XCTAssertEqual(delivery.result.decisionSequence, 8)
-        XCTAssertEqual(delivery.result.finalMatches.map(\.externalIdentifier), ["post-login-share"])
-    }
-
-    func testPreLoginConsumableFinalIsPermanentlyRejectedAndNeverReopened() async throws {
-        let attributionId = "00000000-0000-4000-8000-000000000253"
-        let accountScope = "local_scope_000253"
-        var attributionGetCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000253","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":7,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000354","ruleKey":"icard_share","externalIdentifier":"invalid-pre-login-final","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000153","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            case "/v1/sdk/attributions/\(attributionId)":
-                attributionGetCount += 1
-                return Self.response(request, status: 500, json: #"{"error":"rejected final must never reopen"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-
-        do {
-            _ = try await sdk.resolveInstallation()
-            XCTFail("登录门槛前的可消费 FINAL 是永久协议违例")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .invalidResponse)
-        }
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-        _ = try await sdk.trackLoginCompleted()
-        let stopped = try await sdk.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 1)
-
-        XCTAssertEqual(stopped.phase, .stopped)
-        XCTAssertNil(stopped.result)
-        XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: accountScope))
-        XCTAssertEqual(attributionGetCount, 0, "FINAL 不可重开；登录后不得轮询或复活同一业务结果")
-    }
-
-    func testLoginCompletedDoesNotReopenPreLoginFinal() async throws {
-        var attributionGetCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000209","processState":"FINAL","outcome":"NO_MATCH","status":"NO_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000102","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:02:00Z","reportedAt":"2026-08-24T08:02:01Z"}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000209":
-                attributionGetCount += 1
-                return Self.response(request, status: 500, json: #"{"error":"final must not reopen"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-
-        let beforeLogin = try await sdk.resolveInstallation()
-        _ = try await sdk.trackLoginCompleted()
-        let afterLogin = try await sdk.resolveInstallation()
-
-        XCTAssertEqual(beforeLogin.outcome, .noMatch)
-        XCTAssertEqual(afterLogin, beforeLogin)
-        XCTAssertEqual(attributionGetCount, 0, "迟到登录不得重开或覆盖已冻结 FINAL")
-    }
-
-    func testCachedFinalRejectsDifferentLaterFinal() async throws {
-        let attributionId = "00000000-0000-4000-8000-000000000209"
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000209","processState":"FINAL","outcome":"NO_MATCH","status":"NO_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000102","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:02:00Z","reportedAt":"2026-08-24T08:02:01Z"}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000209":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000209","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":2,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:02:02Z","finalizedAt":"2026-08-24T08:02:02Z","finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000303","ruleKey":"icard_share","externalIdentifier":"share-after-login","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:02:02Z"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-
-        let frozen = try await sdk.resolveInstallation()
-        _ = try await sdk.trackLoginCompleted()
-        do {
-            _ = try await sdk.getAttribution(attributionId: attributionId)
-            XCTFail("已冻结 FINAL 不得被后续不同结果覆盖")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .invalidResponse)
-        }
-        let recovered = try await sdk.resolveInstallation()
-        XCTAssertEqual(recovered, frozen)
-    }
-
-    func testFinalDeliveryPersistsUntilMatchingAccountAcknowledges() async throws {
-        let accountScope = String(repeating: "a", count: 64)
-        let otherAccountScope = String(repeating: "b", count: 64)
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000239","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000139","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000239":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000239","processState":"FINAL","outcome":"MULTIPLE_MATCHES","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":3,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:02Z","finalizedAt":"2026-08-24T08:01:02Z","finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000339","externalIdentifier":"share-a","confidenceBand":"HIGH"},{"linkId":"00000000-0000-4000-8000-000000000340","externalIdentifier":"share-b","confidenceBand":"HIGH"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let first = try makeSdk()
-        try first.recordAuthenticatedLogin(accountScope: accountScope)
-        _ = try await first.resolveInstallation()
-        _ = try await first.trackLoginCompleted()
-        do {
-            _ = try await first.resolveInstallation()
-            XCTFail("resolve 不得直接暴露可消费 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-        do {
-            _ = try await first.getAttribution(attributionId: "00000000-0000-4000-8000-000000000239")
-            XCTFail("get 不得直接暴露可消费 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-        do {
-            _ = try await first.waitForAttribution(
-                attributionId: "00000000-0000-4000-8000-000000000239",
-                timeout: 0.5,
-                interval: 0.01
-            )
-            XCTFail("wait 不得直接暴露可消费 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-        let recoveryOutcome = try await first.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-        XCTAssertEqual(recoveryOutcome.phase, .final)
-        XCTAssertNil(recoveryOutcome.result, "resume 只能通知 outbox 就绪，不能返回 share code")
-
-        let firstDelivery = try XCTUnwrap(first.pendingFinalDelivery(accountScope: accountScope))
-        XCTAssertEqual(firstDelivery.deliveryId, "00000000-0000-4000-8000-000000000239:3")
-        XCTAssertEqual(firstDelivery.result.finalMatches.count, 2)
-        XCTAssertNil(try first.pendingFinalDelivery(accountScope: otherAccountScope))
-
-        let relaunched = try makeSdk()
-        let recovered = try XCTUnwrap(relaunched.pendingFinalDelivery(accountScope: accountScope))
-        XCTAssertEqual(recovered, firstDelivery, "未 ack 的 FINAL 必须跨进程实例恢复")
-        XCTAssertThrowsError(
-            try relaunched.acknowledgeFinalDelivery(deliveryId: recovered.deliveryId, accountScope: otherAccountScope)
-        )
-        try relaunched.acknowledgeFinalDelivery(deliveryId: recovered.deliveryId, accountScope: accountScope)
-        XCTAssertNil(try relaunched.pendingFinalDelivery(accountScope: accountScope))
-        XCTAssertNil(try first.pendingFinalDelivery(accountScope: accountScope), "ack 必须由共享持久状态对其他实例立即可见")
-        XCTAssertTrue(try relaunched.isFinalBound(to: accountScope), "ack 只确认交付，不得删除终态诊断与路由真源")
-        do {
-            _ = try await relaunched.resolveInstallation()
-            XCTFail("ack 后旧入口仍不得旁路 outbox 暴露 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-    }
-
     /// 未绑定账号时 raw 入口也不能暴露业务 FINAL；后来绑定的任意账号不得认领此前结果。
-    func testUnboundRawEntrypointsHideConsumableFinalAndLateBindingIsSuppressed() async throws {
-        let accountScope = String(repeating: "a", count: 64)
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000249","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000149","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000249":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000249","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":2,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:02Z","finalizedAt":"2026-08-24T08:01:02Z","finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000349","externalIdentifier":"legacy-unbound-share","confidenceBand":"HIGH"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-
-        let sdk = try makeSdk()
-        _ = try await sdk.resolveInstallation()
-        _ = try await sdk.trackLoginCompleted()
-        do {
-            _ = try await sdk.resolveInstallation()
-            XCTFail("未绑定账号时 resolve 不得暴露业务 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-        do {
-            _ = try await sdk.getAttribution(attributionId: "00000000-0000-4000-8000-000000000249")
-            XCTFail("未绑定账号时 get 不得暴露业务 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-        do {
-            _ = try await sdk.waitForAttribution(
-                attributionId: "00000000-0000-4000-8000-000000000249",
-                timeout: 0.5,
-                interval: 0.01
-            )
-            XCTFail("未绑定账号时 wait 不得暴露业务 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-        let recoveryOutcome = try await sdk.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-        XCTAssertEqual(recoveryOutcome.phase, .final)
-        XCTAssertNil(recoveryOutcome.result)
-        XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: accountScope))
-
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-
-        XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: accountScope))
-        XCTAssertFalse(try sdk.isFinalBound(to: accountScope))
-        XCTAssertThrowsError(
-            try sdk.acknowledgeFinalDelivery(
-                deliveryId: "00000000-0000-4000-8000-000000000249:2",
-                accountScope: accountScope
-            )
-        )
-        do {
-            _ = try await sdk.resolveInstallation()
-            XCTFail("迟到账号绑定后 raw 入口仍不得暴露被抑制 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .businessDeliveryRequired)
-        }
-    }
-
-    func testFailedLoginConfirmationRetriesSameIdempotencyKeysAcrossInstances() async throws {
-        var loginRequestCount = 0
-        var installationEventIds: [String] = []
-        var loginEventIds: [String] = []
-        var loginOccurredAt: [String] = []
-        var loginReportedAt: [String] = []
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000210","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#)
-            case "/v1/sdk/events/login-completed":
-                loginRequestCount += 1
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                installationEventIds.append(try XCTUnwrap(payload["installationEventId"] as? String))
-                loginEventIds.append(try XCTUnwrap(payload["eventId"] as? String))
-                loginOccurredAt.append(try XCTUnwrap(payload["occurredAt"] as? String))
-                loginReportedAt.append(try XCTUnwrap(payload["reportedAt"] as? String))
-                if loginRequestCount == 1 {
-                    return Self.response(request, status: 503, json: #"{"error":"temporary"}"#)
-                }
-                return Self.response(request, json: #"{"confirmationId":"00000000-0000-4000-8000-000000000103","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:02Z"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let first = try makeSdk()
-        do {
-            _ = try await first.trackLoginCompleted()
-            XCTFail("expected temporary login confirmation failure")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .http(status: 503))
-        }
-
-        try await Task.sleep(nanoseconds: 5_000_000)
-        let relaunched = try makeSdk()
-        let confirmation = try await relaunched.retryPendingLoginConfirmation()
-
-        XCTAssertEqual(confirmation?.confirmationId, "00000000-0000-4000-8000-000000000103")
-        XCTAssertEqual(loginRequestCount, 2)
-        XCTAssertEqual(Set(installationEventIds).count, 1)
-        XCTAssertEqual(Set(loginEventIds).count, 1)
-        XCTAssertEqual(Set(loginOccurredAt).count, 1)
-        XCTAssertEqual(Set(loginReportedAt).count, 2)
-    }
-
-    func testLostLoginResponseDefersSameFinalUntilIdempotentConfirmationRecovers() async throws {
-        let attributionId = "00000000-0000-4000-8000-000000000259"
-        let accountScope = "local_scope_000259"
-        var loginPayloads: [[String: Any]] = []
-        var evidenceRequestCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000259","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":7,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                loginPayloads.append(payload)
-                if loginPayloads.count == 1 {
-                    // 模拟服务端已受理，但客户端在响应到达前断网；下一次必须复用同一幂等事实。
-                    throw URLError(.networkConnectionLost)
-                }
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000159","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:02Z"}"#
-                )
-            case "/v1/sdk/attributions/\(attributionId)":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000259","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":8,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:03Z","finalizedAt":"2026-08-24T08:01:03Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000359","ruleKey":"icard_share","externalIdentifier":"lost-response-share","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:01:03Z"}]}"#
-                )
-            case "/v1/sdk/installations/user-provided-evidence":
-                evidenceRequestCount += 1
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-
-        do {
-            _ = try await sdk.trackLoginCompleted()
-            XCTFail("首次登录确认应模拟响应丢失")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .network("transport"))
-        }
-        do {
-            _ = try await sdk.getAttribution(attributionId: attributionId)
-            XCTFail("确认响应未恢复前不能暴露或缓存 FINAL")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .timeout)
-        }
-        XCTAssertFalse(sdk.canSubmitUserProvidedEvidence)
-        let lateEvidence = await sdk.submitUserProvidedEvidence(.linkToken("first_party_token_259"))
-        XCTAssertEqual(lateEvidence, .rejected)
-        XCTAssertEqual(evidenceRequestCount, 0, "服务端已冻结的待确认 FINAL 不能再被主动证据重开")
-        XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: accountScope))
-
-        try await Task.sleep(nanoseconds: 5_000_000)
-        let relaunched = try makeSdk(userProvidedEvidenceEnabled: true)
-        let outcome = try await relaunched.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-        let delivery = try relaunched.pendingFinalDelivery(accountScope: accountScope)
-
-        XCTAssertEqual(outcome.phase, .final)
-        XCTAssertNil(outcome.result)
-        XCTAssertEqual(delivery?.result.finalMatches.map(\.externalIdentifier), ["lost-response-share"])
-        XCTAssertEqual(loginPayloads.count, 2)
-        XCTAssertEqual(loginPayloads[0]["eventId"] as? String, loginPayloads[1]["eventId"] as? String)
-        XCTAssertEqual(loginPayloads[0]["occurredAt"] as? String, loginPayloads[1]["occurredAt"] as? String)
-        XCTAssertNotEqual(loginPayloads[0]["reportedAt"] as? String, loginPayloads[1]["reportedAt"] as? String)
-    }
-
-    func testPermanentLoginFailureStopsRecoveryUntilANewRealLoginFact() async throws {
-        var loginRequestCount = 0
-        var loginEventIds: [String] = []
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000217","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#)
-            case "/v1/sdk/events/login-completed":
-                loginRequestCount += 1
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                loginEventIds.append(try XCTUnwrap(payload["eventId"] as? String))
-                if loginRequestCount == 1 {
-                    return Self.response(request, status: 401, json: #"{"error":"invalid sdk key"}"#)
-                }
-                return Self.response(request, status: 201, json: #"{"confirmationId":"00000000-0000-4000-8000-000000000110","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:03:00Z","reportedAt":"2026-08-24T08:03:01Z"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let first = try makeSdk()
-        do {
-            _ = try await first.trackLoginCompleted()
-            XCTFail("永久鉴权失败必须向显式调用方返回")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .http(status: 401))
-        }
-
-        let relaunched = try makeSdk()
-        let firstRecovery = try await relaunched.retryPendingLoginConfirmation()
-        let secondRecovery = try await relaunched.retryPendingLoginConfirmation()
-        XCTAssertNil(firstRecovery)
-        XCTAssertNil(secondRecovery)
-        XCTAssertEqual(loginRequestCount, 1, "前台和重启恢复不得重复永久失败请求")
-
-        let confirmation = try await relaunched.trackLoginCompleted()
-        XCTAssertEqual(confirmation.confirmationId, "00000000-0000-4000-8000-000000000110")
-        XCTAssertEqual(loginRequestCount, 2)
-        XCTAssertEqual(Set(loginEventIds).count, 2, "新的真实登录必须创建新事件，而不是复活已被永久拒绝的事实")
-    }
-
     func testUserProvidedEvidenceIsDisabledByDefaultAndNeverReadsOrSendsAnything() async throws {
         var requestCount = 0
         MockURLProtocol.handler = { request in
@@ -1462,25 +1001,67 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertNil(evidence["url"])
     }
 
-    func testUserProvidedEvidenceDoesNotSendAfterFinal() async throws {
+    func testUserProvidedEvidenceQueuesReconciliationAfterTrustedFinalWithoutReplacingLocalFinal() async throws {
         var requestCount = 0
         MockURLProtocol.handler = { request in
             requestCount += 1
-            XCTAssertEqual(request.url?.path, "/v1/sdk/installations/resolve")
-            return Self.response(
-                request,
-                json: #"{"attributionId":"00000000-0000-4000-8000-000000000218","processState":"FINAL","outcome":"NO_MATCH","status":"NO_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#
-            )
+            switch request.url?.path {
+            case "/v1/sdk/installations/resolve", "/v1/sdk/installations/user-provided-evidence":
+                return Self.response(
+                    request,
+                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000218","decisionId":"10000000-0000-4000-8000-000000000218","decisionSequence":2,"processState":"FINAL","outcome":"NO_MATCH","status":"NO_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#
+                )
+            default:
+                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
+            }
         }
         let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0218")
         _ = try await sdk.resolveInstallation()
+        XCTAssertTrue(sdk.canSubmitUserProvidedEvidence)
 
         let submission = await sdk.submitUserProvidedEvidence(.linkToken("link_token_123"))
         let recovery = await sdk.retryPendingUserProvidedEvidence()
 
-        XCTAssertEqual(submission, .rejected)
-        XCTAssertEqual(recovery, .rejected)
-        XCTAssertEqual(requestCount, 1, "FINAL 后不得再创建或发送主动证据")
+        XCTAssertEqual(submission, .accepted)
+        XCTAssertNil(recovery)
+        let preservedFinal = try await sdk.resolveInstallation()
+        XCTAssertEqual(requestCount, 2, "FINAL 后显式证据必须只追加一次 reconciliation 请求")
+        XCTAssertEqual(preservedFinal.decisionId, "10000000-0000-4000-8000-000000000218")
+        XCTAssertEqual(preservedFinal.outcome, .noMatch, "对账请求不得重开或替换本地原 FINAL")
+    }
+
+    func testFinalUserProvidedEvidenceRetriesSameFactAcrossRelaunch() async throws {
+        var evidencePayloads: [[String: Any]] = []
+        let final = #"{"attributionId":"00000000-0000-4000-8000-000000000220","decisionId":"10000000-0000-4000-8000-000000000220","decisionSequence":2,"processState":"FINAL","outcome":"NO_MATCH","status":"NO_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","finalMatches":[]}"#
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/v1/sdk/installations/resolve":
+                return Self.response(request, json: final)
+            case "/v1/sdk/installations/user-provided-evidence":
+                evidencePayloads.append(try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any])
+                if evidencePayloads.count == 1 {
+                    return Self.response(request, status: 503, json: #"{"error":"temporary"}"#)
+                }
+                return Self.response(request, json: final)
+            default:
+                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
+            }
+        }
+        let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0220")
+        _ = try await sdk.resolveInstallation()
+
+        let first = await sdk.submitUserProvidedEvidence(.linkToken("link_token_220"))
+        XCTAssertEqual(first, .deferred)
+        try await Task.sleep(nanoseconds: 5_000_000)
+        let retried = await (try makeSdk(userProvidedEvidenceEnabled: true)).retryPendingUserProvidedEvidence()
+
+        XCTAssertEqual(retried, .accepted)
+        XCTAssertEqual(evidencePayloads.count, 2)
+        XCTAssertEqual(evidencePayloads[0]["eventId"] as? String, evidencePayloads[1]["eventId"] as? String)
+        XCTAssertEqual(evidencePayloads[0]["occurredAt"] as? String, evidencePayloads[1]["occurredAt"] as? String)
+        XCTAssertNotEqual(evidencePayloads[0]["reportedAt"] as? String, evidencePayloads[1]["reportedAt"] as? String)
     }
 
     func testUserProvidedEvidenceStopsWhenInitialResolveBecomesFinal() async throws {
@@ -1509,58 +1090,7 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertEqual(submission, .rejected)
         XCTAssertEqual(recovery, .rejected)
         XCTAssertEqual(resolveRequestCount, 1)
-        XCTAssertEqual(evidenceRequestCount, 0, "安装登记冻结 FINAL 后不得再触发主动证据接口")
-    }
-
-    func testUserProvidedEvidenceWaitsAcrossRelaunchForHigherFinalDecision() async throws {
-        let accountScope = "local_scope_000212"
-        var attributionGetCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000212","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#)
-            case "/v1/sdk/installations/user-provided-evidence":
-                // 证据端点只确认受理并触发 Worker；返回当前旧决策，不得被当成内联归因结果。
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000212","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:02Z","retryAfterMs":0,"finalMatches":[]}"#)
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000104","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000212":
-                attributionGetCount += 1
-                if attributionGetCount <= 2 {
-                    return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000212","processState":"SETTLING","status":"PENDING","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:03Z","retryAfterMs":0,"finalMatches":[]}"#)
-                }
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000212","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:04Z","finalizedAt":"2026-08-24T08:00:04Z","finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000305","externalIdentifier":"share-123","confidenceBand":"HIGH"}]}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-
-        let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
-        let submission = await sdk.submitUserProvidedEvidence(
-            .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "share-123")
-        )
-        guard case .accepted = submission else { return XCTFail("evidence should be accepted") }
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-        _ = try await sdk.trackLoginCompleted()
-
-        let firstAttempt = try await sdk.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-        let relaunched = try makeSdk(userProvidedEvidenceEnabled: true)
-        let secondAttempt = try await relaunched.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-        let recovered = try makeSdk(userProvidedEvidenceEnabled: true)
-        let finalAttempt = try await recovered.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
-        let delivery = try XCTUnwrap(recovered.pendingFinalDelivery(accountScope: accountScope))
-
-        XCTAssertEqual(firstAttempt.phase, .retryScheduled)
-        XCTAssertEqual(secondAttempt.phase, .retryScheduled)
-        XCTAssertEqual(finalAttempt.phase, .final)
-        XCTAssertNil(finalAttempt.result, "恢复入口不得绕过账号 outbox 暴露可消费 FINAL")
-        XCTAssertEqual(attributionGetCount, 3)
-        XCTAssertEqual(delivery.result.finalMatches.first?.externalIdentifier, "share-123")
-        XCTAssertEqual(delivery.result.resolverType, .iOSUserProvidedLink)
+        XCTAssertEqual(evidenceRequestCount, 0, "缺少本地可信登录绑定时不得在 FINAL 后触发主动证据接口")
     }
 
     func testUserProvidedEvidenceNetworkFailureDefersAndRetriesSameFactAcrossRelaunch() async throws {
@@ -1676,378 +1206,9 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertNil(pending)
         XCTAssertEqual(requestCount, 0)
         XCTAssertFalse(
-            defaults.dictionaryRepresentation().keys.contains(where: { $0.hasSuffix(".installation.v3") }),
+            defaults.dictionaryRepresentation().keys.contains(where: { $0.hasSuffix(".installation.v4") }),
             "标题、换行和完整业务链接必须由宿主在内存中解析；SDK 不得保存整段用户输入"
         )
-    }
-
-    func testLoginPendingIsPersistedBeforeInstallationFailureAndRecoveredAfterRelaunch() async throws {
-        var installationRequestCount = 0
-        var loginRequestCount = 0
-        var installationEventIds: [String] = []
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                installationRequestCount += 1
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                installationEventIds.append(try XCTUnwrap(payload["eventId"] as? String))
-                if installationRequestCount == 1 {
-                    return Self.response(request, status: 503, json: #"{"error":"temporary"}"#)
-                }
-                return Self.response(request, json: #"{"attributionId":"00000000-0000-4000-8000-000000000215","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:03Z","retryAfterMs":1000,"finalMatches":[]}"#)
-            case "/v1/sdk/events/login-completed":
-                loginRequestCount += 1
-                return Self.response(request, json: #"{"confirmationId":"00000000-0000-4000-8000-000000000105","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:02:00Z","reportedAt":"2026-08-24T08:02:01Z"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let first = try makeSdk()
-        do {
-            _ = try await first.trackLoginCompleted()
-            XCTFail("expected temporary installation registration failure")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .http(status: 503))
-        }
-
-        let relaunched = try makeSdk()
-        let confirmation = try await relaunched.retryPendingLoginConfirmation()
-
-        XCTAssertEqual(confirmation?.confirmationId, "00000000-0000-4000-8000-000000000105")
-        XCTAssertEqual(installationRequestCount, 2)
-        XCTAssertEqual(loginRequestCount, 1)
-        XCTAssertEqual(Set(installationEventIds).count, 1)
-    }
-
-    func testConcurrentInstallationLoginAndUserEvidencePreserveBothDurableFacts() async throws {
-        let installationStarted = expectation(description: "installation request started")
-        let releaseInstallation = DispatchSemaphore(value: 0)
-        let recorderLock = NSLock()
-        var loginPayloads: [[String: Any]] = []
-        var evidencePayloads: [[String: Any]] = []
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                installationStarted.fulfill()
-                _ = releaseInstallation.wait(timeout: .now() + 2)
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000216","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                recorderLock.lock()
-                loginPayloads.append(payload)
-                recorderLock.unlock()
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000106","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:02Z"}"#
-                )
-            case "/v1/sdk/installations/user-provided-evidence":
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                recorderLock.lock()
-                evidencePayloads.append(payload)
-                let count = evidencePayloads.count
-                recorderLock.unlock()
-                if count == 1 {
-                    return Self.response(request, status: 503, json: #"{"error":"temporary"}"#)
-                }
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000216","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:01:03Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
-        let installationTask = Task { try await sdk.resolveInstallation() }
-        await fulfillment(of: [installationStarted], timeout: 2)
-        let loginTask = Task { try await sdk.trackLoginCompleted() }
-        let evidenceTask = Task {
-            await sdk.submitUserProvidedEvidence(
-                .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "share-concurrent")
-            )
-        }
-        try await Task.sleep(nanoseconds: 10_000_000)
-        releaseInstallation.signal()
-
-        _ = try await installationTask.value
-        _ = try? await loginTask.value
-        let firstEvidenceResult = await evidenceTask.value
-        XCTAssertTrue(firstEvidenceResult == .deferred || firstEvidenceResult == .accepted)
-
-        let relaunched = try makeSdk(userProvidedEvidenceEnabled: true)
-        let recoveredEvidence = await relaunched.retryPendingUserProvidedEvidence()
-        let recoveredLogin = try await relaunched.retryPendingLoginConfirmation()
-
-        XCTAssertTrue(
-            recoveredEvidence == nil || recoveredEvidence == .accepted,
-            "unexpected recovered evidence result: \(String(describing: recoveredEvidence))"
-        )
-        XCTAssertTrue(recoveredLogin == nil || recoveredLogin?.confirmationId == "00000000-0000-4000-8000-000000000106")
-        XCTAssertEqual(loginPayloads.count, 1)
-        XCTAssertEqual(evidencePayloads.count, 2)
-        XCTAssertEqual(evidencePayloads[0]["eventId"] as? String, evidencePayloads[1]["eventId"] as? String)
-        XCTAssertEqual(evidencePayloads[0]["occurredAt"] as? String, evidencePayloads[1]["occurredAt"] as? String)
-    }
-
-    func testClearLocalStateDropsLateInstallationResponseWithoutRecreatingOldGeneration() async throws {
-        let firstRequestStarted = expectation(description: "first installation request started")
-        let releaseFirstRequest = DispatchSemaphore(value: 0)
-        var installationPayloads: [[String: Any]] = []
-        var installationCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                installationCount += 1
-                let payload = try JSONSerialization.jsonObject(with: Self.bodyData(request)) as! [String: Any]
-                installationPayloads.append(payload)
-                if installationCount == 1 {
-                    firstRequestStarted.fulfill()
-                    _ = releaseFirstRequest.wait(timeout: .now() + 2)
-                }
-                let suffix = installationCount == 1 ? "000000000271" : "000000000272"
-                return Self.response(
-                    request,
-                    json: "{\"attributionId\":\"00000000-0000-4000-8000-\(suffix)\",\"processState\":\"PROVISIONAL\",\"status\":\"PENDING\",\"resolverType\":\"IOS_PROBABILISTIC_INSTALL\",\"decisionSequence\":0,\"occurredAt\":\"2026-08-24T08:00:00Z\",\"reportedAt\":\"2026-08-24T08:00:01Z\",\"retryAfterMs\":1000,\"finalMatches\":[]}"
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000172","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-        let oldTask = Task { try await sdk.resolveInstallation() }
-        await fulfillment(of: [firstRequestStarted], timeout: 2)
-
-        sdk.clearLocalState()
-        try sdk.recordAuthenticatedLogin(accountScope: "local_scope_000272")
-        releaseFirstRequest.signal()
-        do {
-            _ = try await oldTask.value
-            XCTFail("旧安装迟到响应必须按取消丢弃")
-        } catch is CancellationError {
-            // 旧请求不能复活已清理代次。
-        }
-
-        let confirmation = try await sdk.trackLoginCompleted()
-        XCTAssertEqual(confirmation.confirmationId, "00000000-0000-4000-8000-000000000172")
-        XCTAssertEqual(installationPayloads.count, 2)
-        XCTAssertNotEqual(installationPayloads[0]["eventId"] as? String, installationPayloads[1]["eventId"] as? String)
-    }
-
-    func testClearLocalStatePreventsLateRecoveryFailureFromSchedulingNewGeneration() async throws {
-        let oldRequestStarted = expectation(description: "old recovery request started")
-        let releaseOldRequest = DispatchSemaphore(value: 0)
-        var installationCount = 0
-        var attributionQueryCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                installationCount += 1
-                if installationCount == 1 {
-                    oldRequestStarted.fulfill()
-                    _ = releaseOldRequest.wait(timeout: .now() + 2)
-                    return Self.response(request, status: 503, json: #"{"error":"late old failure"}"#)
-                }
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000273","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000273":
-                attributionQueryCount += 1
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000273","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-        let oldRecovery = Task { try await sdk.resumePendingAttribution(trigger: .appLaunch, pollingTimeout: 0) }
-        await fulfillment(of: [oldRequestStarted], timeout: 2)
-
-        sdk.clearLocalState()
-        try sdk.bindAuthenticatedAccount(scope: "local_scope_000273")
-        releaseOldRequest.signal()
-        do {
-            _ = try await oldRecovery.value
-            XCTFail("旧恢复失败不得给新安装写退避")
-        } catch is CancellationError {
-            // expected
-        }
-
-        _ = try await sdk.resolveInstallation()
-        let outcome = try await sdk.resumePendingAttribution(trigger: .appLaunch, pollingTimeout: 0)
-        XCTAssertEqual(outcome.phase, .waitingForLogin)
-        XCTAssertEqual(installationCount, 2)
-        XCTAssertEqual(attributionQueryCount, 1)
-    }
-
-    func testClearLocalStatePreventsLateLoginRejectionFromStoppingNewGeneration() async throws {
-        let oldLoginStarted = expectation(description: "old login request started")
-        let releaseOldLogin = DispatchSemaphore(value: 0)
-        var installationCount = 0
-        var loginCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                installationCount += 1
-                let suffix = installationCount == 1 ? "000000000274" : "000000000275"
-                return Self.response(
-                    request,
-                    json: "{\"attributionId\":\"00000000-0000-4000-8000-\(suffix)\",\"processState\":\"PROVISIONAL\",\"status\":\"PENDING\",\"resolverType\":\"IOS_PROBABILISTIC_INSTALL\",\"decisionSequence\":0,\"occurredAt\":\"2026-08-24T08:00:00Z\",\"reportedAt\":\"2026-08-24T08:00:01Z\",\"retryAfterMs\":1000,\"finalMatches\":[]}"
-                )
-            case "/v1/sdk/events/login-completed":
-                loginCount += 1
-                if loginCount == 1 {
-                    oldLoginStarted.fulfill()
-                    _ = releaseOldLogin.wait(timeout: .now() + 2)
-                    return Self.response(request, status: 401, json: #"{"error":"old login rejected"}"#)
-                }
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000175","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-        _ = try await sdk.resolveInstallation()
-        try sdk.recordAuthenticatedLogin(accountScope: "local_scope_000274")
-        let oldLogin = Task { try await sdk.trackLoginCompleted() }
-        await fulfillment(of: [oldLoginStarted], timeout: 2)
-
-        sdk.clearLocalState()
-        try sdk.recordAuthenticatedLogin(accountScope: "local_scope_000275")
-        releaseOldLogin.signal()
-        do {
-            _ = try await oldLogin.value
-            XCTFail("旧登录应返回原永久失败")
-        } catch let error as LinkAttributionError {
-            XCTAssertEqual(error, .http(status: 401))
-        }
-
-        let confirmation = try await sdk.trackLoginCompleted()
-        XCTAssertEqual(confirmation.confirmationId, "00000000-0000-4000-8000-000000000175")
-        XCTAssertEqual(installationCount, 2)
-        XCTAssertEqual(loginCount, 2)
-    }
-
-    func testPendingLoginRetryCannotCreateLoginFactAfterLocalStateWasCleared() async throws {
-        let queryStarted = expectation(description: "old attribution query started")
-        let releaseQuery = DispatchSemaphore(value: 0)
-        var loginCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000276","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000276":
-                queryStarted.fulfill()
-                _ = releaseQuery.wait(timeout: .now() + 2)
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000276","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:02Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                loginCount += 1
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-        let provisional = try await sdk.resolveInstallation()
-        try sdk.recordAuthenticatedLogin(accountScope: "local_scope_000276")
-        let oldQuery = Task { try await sdk.getAttribution(attributionId: provisional.attributionId) }
-        await fulfillment(of: [queryStarted], timeout: 2)
-        let retry = Task { try await sdk.retryPendingLoginConfirmation() }
-        try await Task.sleep(nanoseconds: 10_000_000)
-
-        sdk.clearLocalState()
-        releaseQuery.signal()
-        _ = try? await oldQuery.value
-        do {
-            _ = try await retry.value
-            XCTFail("旧安装登录重试不得在清理后创建新登录事实")
-        } catch is CancellationError {
-            // retry 冻结 A 的 eventId；释放网络门禁后发现代次已删除，必须取消而不是在 B 上造登录。
-        }
-
-        XCTAssertFalse(sdk.hasRecordedLoginCompletedFact)
-        XCTAssertEqual(loginCount, 0)
-    }
-
-    func testPendingUserEvidenceIsFlushedBeforeLoginCanFreezeFinal() async throws {
-        var evidenceRequestCount = 0
-        var decisionInputOrder: [String] = []
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000217","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/installations/user-provided-evidence":
-                evidenceRequestCount += 1
-                decisionInputOrder.append("evidence")
-                if evidenceRequestCount == 1 {
-                    return Self.response(request, status: 503, json: #"{"error":"temporary"}"#)
-                }
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000217","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_USER_PROVIDED_LINK","occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:03Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                decisionInputOrder.append("login")
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000107","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:01:00Z","reportedAt":"2026-08-24T08:01:01Z"}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-            }
-        }
-        let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
-
-        let initialEvidence = await sdk.submitUserProvidedEvidence(
-            .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "share-before-login")
-        )
-        XCTAssertEqual(initialEvidence, .deferred)
-        let confirmation = try await sdk.trackLoginCompleted()
-        let remainingEvidence = await sdk.retryPendingUserProvidedEvidence()
-
-        XCTAssertEqual(confirmation.confirmationId, "00000000-0000-4000-8000-000000000107")
-        XCTAssertEqual(decisionInputOrder, ["evidence", "evidence", "login"])
-        XCTAssertNil(remainingEvidence)
-    }
-
-    func testRetryWithoutPendingLoginDoesNotCreateLoginFactOrRequest() async throws {
-        var requestCount = 0
-        MockURLProtocol.handler = { request in
-            requestCount += 1
-            return Self.response(request, status: 500, json: #"{"error":"unexpected request"}"#)
-        }
-        let sdk = try makeSdk()
-
-        let confirmation = try await sdk.retryPendingLoginConfirmation()
-
-        XCTAssertNil(confirmation)
-        XCTAssertEqual(requestCount, 0)
     }
 
     func testHTTPFailureHasStableTypedError() async throws {
@@ -2169,7 +1330,7 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertEqual(payloads.count, 2)
         XCTAssertEqual(payloads[0]["eventId"] as? String, payloads[1]["eventId"] as? String)
         XCTAssertEqual(payloads[0]["occurredAt"] as? String, payloads[1]["occurredAt"] as? String)
-        XCTAssertEqual(defaults.dictionaryRepresentation().keys.filter { $0.hasSuffix(".installation.v3") }.count, 1)
+        XCTAssertEqual(defaults.dictionaryRepresentation().keys.filter { $0.hasSuffix(".installation.v4") }.count, 1)
     }
 
     func testApiBaseURLRejectsPathBeforeAnyNetworkRequest() throws {
@@ -2440,104 +1601,6 @@ final class LinkAttributionTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
-    func testRecoveryOrchestratesLoginToFinalAndLeavesDurableDeliveryUntilAck() async throws {
-        let accountScope = "local_scope_123456"
-        var paths: [String] = []
-        MockURLProtocol.handler = { request in
-            paths.append(request.url?.path ?? "")
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000402","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":0,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":1000,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000403","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:00:02Z","reportedAt":"2026-08-24T08:00:03Z"}"#
-                )
-            case "/v1/sdk/attributions/00000000-0000-4000-8000-000000000402":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000402","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:04Z","finalizedAt":"2026-08-24T08:00:04Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000404","ruleKey":"share","externalIdentifier":"share-402","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:04Z"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-
-        let outcome = try await sdk.resumePendingAttribution(trigger: .appForeground, pollingTimeout: 0)
-        let delivery = try sdk.pendingFinalDelivery(accountScope: accountScope)
-
-        XCTAssertEqual(outcome.phase, .final)
-        XCTAssertNil(outcome.result)
-        XCTAssertEqual(delivery?.result.finalMatches.map(\.externalIdentifier), ["share-402"])
-        XCTAssertEqual(paths, [
-            "/v1/sdk/installations/resolve",
-            "/v1/sdk/events/login-completed",
-            "/v1/sdk/attributions/00000000-0000-4000-8000-000000000402",
-        ])
-
-        let relaunched = try makeSdk()
-        XCTAssertEqual(try relaunched.pendingFinalDelivery(accountScope: accountScope)?.deliveryId, delivery?.deliveryId)
-        try relaunched.acknowledgeFinalDelivery(
-            deliveryId: try XCTUnwrap(delivery?.deliveryId),
-            accountScope: accountScope
-        )
-        XCTAssertNil(try relaunched.pendingFinalDelivery(accountScope: accountScope))
-    }
-
-    func testRecoveryUsesForegroundBudgetAcrossRepeatedStaleDecision() async throws {
-        let attributionId = "00000000-0000-4000-8000-000000000452"
-        let accountScope = "local_scope_000452"
-        var getCount = 0
-        MockURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000452","processState":"PROVISIONAL","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":7,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[]}"#
-                )
-            case "/v1/sdk/events/login-completed":
-                return Self.response(
-                    request,
-                    status: 201,
-                    json: #"{"confirmationId":"00000000-0000-4000-8000-000000000453","status":"RECORDED","source":"SDK_REPORTED","occurredAt":"2026-08-24T08:00:02Z","reportedAt":"2026-08-24T08:00:03Z"}"#
-                )
-            case "/v1/sdk/attributions/\(attributionId)":
-                getCount += 1
-                if getCount <= 2 {
-                    return Self.response(
-                        request,
-                        json: #"{"attributionId":"00000000-0000-4000-8000-000000000452","processState":"SETTLING","status":"PENDING","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":7,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:04Z","retryAfterMs":0,"finalMatches":[]}"#
-                    )
-                }
-                return Self.response(
-                    request,
-                    json: #"{"attributionId":"00000000-0000-4000-8000-000000000452","processState":"FINAL","outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":8,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:05Z","finalizedAt":"2026-08-24T08:00:05Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000454","ruleKey":"share","externalIdentifier":"stale-then-final","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:05Z"}]}"#
-                )
-            default:
-                return Self.response(request, status: 500, json: #"{"error":"unexpected"}"#)
-            }
-        }
-        let sdk = try makeSdk()
-        _ = try await sdk.resolveInstallation()
-        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
-
-        let outcome = try await sdk.resumePendingAttribution(trigger: .appForeground, pollingTimeout: 1)
-
-        XCTAssertEqual(outcome.phase, .final)
-        XCTAssertNil(outcome.result)
-        XCTAssertGreaterThanOrEqual(getCount, 3)
-        XCTAssertEqual(
-            try sdk.pendingFinalDelivery(accountScope: accountScope)?.result.finalMatches.map(\.externalIdentifier),
-            ["stale-then-final"]
-        )
-    }
-
     func testPermanentRecoveryFailureStopsAcrossRelaunchUntilExplicitReset() async throws {
         var requestCount = 0
         MockURLProtocol.handler = { request in
@@ -2596,7 +1659,7 @@ final class LinkAttributionTests: XCTestCase {
     private func currentInstallationStorageKey() throws -> String {
         try XCTUnwrap(
             defaults.dictionaryRepresentation().keys.first(where: {
-                $0.hasPrefix("test.") && $0.hasSuffix(".installation.v3")
+                $0.hasPrefix("test.") && $0.hasSuffix(".installation.v4")
             })
         )
     }
@@ -2628,6 +1691,12 @@ final class LinkAttributionTests: XCTestCase {
         }
         if object["decisionSequence"] == nil {
             object["decisionSequence"] = processState == "FINAL" ? 1 : 0
+        }
+        if let decisionSequence = object["decisionSequence"] as? Int,
+           decisionSequence > 0,
+           object["decisionId"] == nil,
+           let installInstanceId = object["attributionId"] as? String {
+            object["decisionId"] = "10000000-0000-4000-8000-\(installInstanceId.suffix(12))"
         }
         if object["outcome"] == nil {
             object["outcome"] = NSNull()

@@ -2,338 +2,539 @@ import Foundation
 import XCTest
 @testable import LinkAttributionSDK
 
-/// 登录恢复跨证据请求的安装代次回归；只使用本地 URLProtocol，不连接真实服务或设备。
+/// Server Key 登录信任链回归；只使用本地 URLProtocol，不连接真实服务或设备。
 final class LinkAttributionLoginRecoveryTests: XCTestCase {
     private var defaults: UserDefaults!
     private var suiteName: String!
 
     override func setUp() {
         super.setUp()
-        suiteName = "LinkAttributionLoginRecoveryTests.\(UUID().uuidString)"
+        suiteName = "LinkAttributionServerLoginTruthTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
     }
 
     override func tearDown() {
-        LoginRecoveryURLProtocol.handler = nil
+        ServerLoginTruthURLProtocol.handler = nil
         defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
         suiteName = nil
         super.tearDown()
     }
 
-    func testPendingEvidenceSuccessCannotMoveOldLoginRecoveryToReplacementInstallation() async throws {
-        try await assertReplacementInstallationIsUntouched(evidenceStatus: 200)
+    func testRetiredMobileLoginEntrypointsNeverMutateOrUseNetwork() async throws {
+        var requestCount = 0
+        ServerLoginTruthURLProtocol.handler = { request in
+            requestCount += 1
+            return try Self.response(request, status: 500, body: ["error": "unexpected"])
+        }
+        let sdk = try makeSdk()
+
+        do {
+            _ = try await sdk.trackLoginCompleted()
+            XCTFail("停用入口必须返回稳定错误")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(
+                error,
+                .invalidArgument("mobile login confirmation is retired; use local account binding and Server Key confirmation")
+            )
+        }
+        let retry = try await sdk.retryPendingLoginConfirmation()
+        XCTAssertNil(retry)
+        XCTAssertThrowsError(try sdk.recordLoginCompletedOccurrence())
+        XCTAssertThrowsError(try sdk.bindAuthenticatedAccount(scope: "account_scope_0001"))
+        XCTAssertEqual(requestCount, 0)
+        XCTAssertTrue(defaults.dictionaryRepresentation().keys.allSatisfy { $0.hasSuffix(".installation.v4") == false })
     }
 
-    func testPendingEvidenceNetworkFailureCannotMoveOldLoginRecoveryToReplacementInstallation() async throws {
-        try await assertReplacementInstallationIsUntouched(evidenceStatus: 503)
+    func testLocalAccountBindingPollsSameAttributionAndDeliversServerFinalUntilAck() async throws {
+        let attributionId = "00000000-0000-4000-8000-000000000301"
+        let accountScope = "account_scope_0301"
+        var paths: [String] = []
+        ServerLoginTruthURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            paths.append(path)
+            switch path {
+            case "/v1/sdk/installations/resolve":
+                return try Self.provisionalResponse(request, attributionId: attributionId, sequence: 1)
+            case "/v1/sdk/attributions/\(attributionId)":
+                return try Self.matchedFinalResponse(request, attributionId: attributionId, sequence: 2, share: "server-confirmed")
+            default:
+                XCTFail("unexpected request: \(path)")
+                return try Self.response(request, status: 500, body: ["error": "unexpected"])
+            }
+        }
+
+        let sdk = try makeSdk()
+        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
+        let provisional = try await sdk.resolveInstallation()
+        XCTAssertEqual(provisional.attributionId, attributionId)
+        XCTAssertEqual(provisional.decisionId, Self.decisionId(for: attributionId))
+        let outcome = try await sdk.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
+
+        XCTAssertEqual(outcome.phase, .final)
+        XCTAssertNil(outcome.result, "可消费 FINAL 只能从账号 outbox 读取")
+        XCTAssertEqual(paths, ["/v1/sdk/installations/resolve", "/v1/sdk/attributions/\(attributionId)"])
+        let delivery = try XCTUnwrap(sdk.pendingFinalDelivery(accountScope: accountScope))
+        XCTAssertEqual(delivery.result.decisionId, Self.decisionId(for: attributionId))
+        XCTAssertEqual(delivery.result.finalMatches.first?.externalIdentifier, "server-confirmed")
+        XCTAssertThrowsError(try sdk.acknowledgeFinalDelivery(deliveryId: delivery.deliveryId, accountScope: "other_account_0301"))
+
+        let relaunched = try makeSdk()
+        XCTAssertEqual(try relaunched.pendingFinalDelivery(accountScope: accountScope)?.deliveryId, delivery.deliveryId)
+        try relaunched.acknowledgeFinalDelivery(deliveryId: delivery.deliveryId, accountScope: accountScope)
+        XCTAssertNil(try relaunched.pendingFinalDelivery(accountScope: accountScope))
+        XCTAssertTrue(try relaunched.isFinalBound(to: accountScope))
     }
 
-    func testPendingEvidenceSuccessKeepsOriginalInstallationAndLoginFacts() async throws {
-        try await assertOriginalFactsAreRetained(evidenceRetryFails: false)
+    func testAccountBindingIsAtomicIdempotentAndCannotSwitchAccounts() throws {
+        let sdk = try makeSdk()
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0401")
+        let first = try stateObject()
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0401")
+        let second = try stateObject()
+
+        XCTAssertEqual(first["loginEventId"] as? String, second["loginEventId"] as? String)
+        XCTAssertEqual(first["loginOccurredAt"] as? String, second["loginOccurredAt"] as? String)
+        XCTAssertEqual(second["deliveryAccountScope"] as? String, "account_scope_0401")
+        XCTAssertEqual(second["deliveryAccountScopeTrusted"] as? Bool, true)
+        XCTAssertNil(second["loginConfirmation"])
+        XCTAssertNil(second["loginSubmissionAttemptedAt"])
+        XCTAssertThrowsError(try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0402"))
+        XCTAssertEqual(
+            try JSONSerialization.data(withJSONObject: first, options: [.sortedKeys]),
+            try JSONSerialization.data(withJSONObject: second, options: [.sortedKeys])
+        )
     }
 
-    func testPendingEvidenceNetworkFailureRetainsFactsUntilRelaunchRetry() async throws {
-        try await assertOriginalFactsAreRetained(evidenceRetryFails: true)
-    }
-
-    func testCancelledLoginRecoveryPropagatesCancellationAndRetainsOriginalPendingFacts() async throws {
-        let evidenceStarted = expectation(description: "login recovery is awaiting pending evidence")
-        let releaseEvidence = DispatchSemaphore(value: 0)
-        defer { releaseEvidence.signal() }
+    func testLostFinalResponseRetriesSameAttributionWithoutRecreatingInstallation() async throws {
+        let attributionId = "00000000-0000-4000-8000-000000000501"
+        let accountScope = "account_scope_0501"
         var installationCount = 0
-        var evidencePayloads: [[String: Any]] = []
-        var loginPayloads: [[String: Any]] = []
-        LoginRecoveryURLProtocol.handler = { request in
+        var getCount = 0
+        ServerLoginTruthURLProtocol.handler = { request in
             switch request.url?.path {
             case "/v1/sdk/installations/resolve":
                 installationCount += 1
-                return try Self.provisionalResponse(request, installationNumber: 1)
-            case "/v1/sdk/installations/user-provided-evidence":
-                evidencePayloads.append(try Self.payload(request))
-                if evidencePayloads.count == 1 {
-                    return try Self.response(request, status: 503, body: ["error": "temporary"])
-                }
-                if evidencePayloads.count == 2 {
-                    evidenceStarted.fulfill()
-                    XCTAssertEqual(releaseEvidence.wait(timeout: .now() + 3), .success)
-                    // 受控传输在任务取消后回传 URLSession 的取消结果，不清理或重建安装状态。
-                    throw URLError(.cancelled)
-                }
-                return try Self.provisionalResponse(request, installationNumber: 1)
-            case "/v1/sdk/events/login-completed":
-                loginPayloads.append(try Self.payload(request))
-                return try Self.loginResponse(request)
+                return try Self.provisionalResponse(request, attributionId: attributionId, sequence: 1)
+            case "/v1/sdk/attributions/\(attributionId)":
+                getCount += 1
+                if getCount == 1 { throw URLError(.networkConnectionLost) }
+                return try Self.matchedFinalResponse(request, attributionId: attributionId, sequence: 2, share: "response-loss")
             default:
-                XCTFail("unexpected request: \(request.url?.path ?? "missing")")
                 return try Self.response(request, status: 500, body: ["error": "unexpected"])
             }
         }
 
         let sdk = try makeSdk()
-        let submission = await sdk.submitUserProvidedEvidence(.linkToken("pending_cancellation_token"))
-        XCTAssertEqual(submission, .deferred)
-        try sdk.recordAuthenticatedLogin(accountScope: "original_account_scope")
-        let originalData = try stateData()
-        let originalState = try stateObject()
-        let recovery = Task { try await sdk.retryPendingLoginConfirmation() }
-        await fulfillment(of: [evidenceStarted], timeout: 3)
-
-        recovery.cancel()
-        releaseEvidence.signal()
+        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
+        _ = try await sdk.resolveInstallation()
         do {
-            _ = try await recovery.value
-            XCTFail("被取消的登录恢复不得继续或返回普通成功")
-        } catch is CancellationError {
-            // 公共证据提交可返回 deferred；抛错式登录恢复必须保留调用任务的取消语义。
-        } catch {
-            XCTFail("同一安装代次的取消应原样传播，实际为 \(error)")
+            _ = try await sdk.getAttribution(attributionId: attributionId)
+            XCTFail("首次响应丢失必须保留为可重试传输失败")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .network("transport"))
         }
-        XCTAssertTrue(loginPayloads.isEmpty, "取消证据等待后不得继续登录 POST")
-        XCTAssertEqual(try stateData(), originalData, "取消不能改写已持久化的证据、登录事实或发送标记")
 
-        // 新实例仍能恢复原待办，取消不等于永久拒绝或丢弃首次事实。
-        try await Task.sleep(nanoseconds: 5_000_000)
-        let confirmation = try await makeSdk().retryPendingLoginConfirmation()
-        XCTAssertNotNil(confirmation)
-        XCTAssertEqual(installationCount, 1)
-        XCTAssertEqual(evidencePayloads.count, 3)
-        XCTAssertEqual(loginPayloads.count, 1)
-        for payload in evidencePayloads {
-            XCTAssertEqual(payload["installationEventId"] as? String, originalState["eventId"] as? String)
-            XCTAssertEqual(payload["eventId"] as? String, evidencePayloads.first?["eventId"] as? String)
-            XCTAssertEqual(payload["occurredAt"] as? String, evidencePayloads.first?["occurredAt"] as? String)
+        let relaunched = try makeSdk()
+        do {
+            _ = try await relaunched.getAttribution(attributionId: attributionId)
+            XCTFail("可消费 FINAL 不得从旧查询入口直接返回")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .businessDeliveryRequired)
         }
-        let login = try XCTUnwrap(loginPayloads.first)
-        XCTAssertEqual(login["eventId"] as? String, originalState["loginEventId"] as? String)
-        XCTAssertEqual(login["occurredAt"] as? String, originalState["loginOccurredAt"] as? String)
-        XCTAssertNil(try stateObject()["pendingUserProvidedEvidence"])
+        XCTAssertEqual(installationCount, 1)
+        XCTAssertEqual(getCount, 2)
+        XCTAssertEqual(
+            try relaunched.pendingFinalDelivery(accountScope: accountScope)?.result.finalMatches.first?.externalIdentifier,
+            "response-loss"
+        )
     }
 
-    private func assertReplacementInstallationIsUntouched(evidenceStatus: Int) async throws {
-        let evidenceStarted = expectation(description: "old login recovery is awaiting evidence")
-        let releaseEvidence = DispatchSemaphore(value: 0)
-        defer { releaseEvidence.signal() }
-        var installationIds: [String] = []
-        var loginPayloads: [[String: Any]] = []
-        var evidenceCount = 0
-        LoginRecoveryURLProtocol.handler = { request in
+    func testLoginBindingDuringInstallationResponseIsMergedBeforeFinalValidation() async throws {
+        let attributionId = "00000000-0000-4000-8000-000000000551"
+        let responseStarted = expectation(description: "installation response is pending")
+        let releaseResponse = DispatchSemaphore(value: 0)
+        defer { releaseResponse.signal() }
+        ServerLoginTruthURLProtocol.handler = { request in
+            responseStarted.fulfill()
+            XCTAssertEqual(releaseResponse.wait(timeout: .now() + 3), .success)
+            return try Self.matchedFinalResponse(request, attributionId: attributionId, sequence: 1, share: "concurrent-binding")
+        }
+
+        let sdk = try makeSdk()
+        let installation = Task { try await sdk.resolveInstallation() }
+        await fulfillment(of: [responseStarted], timeout: 3)
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0551")
+        releaseResponse.signal()
+        do {
+            _ = try await installation.value
+            XCTFail("业务 FINAL 应进入 outbox 而不是旧查询返回值")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .businessDeliveryRequired)
+        }
+        XCTAssertEqual(
+            try sdk.pendingFinalDelivery(accountScope: "account_scope_0551")?.result.finalMatches.first?.externalIdentifier,
+            "concurrent-binding"
+        )
+    }
+
+    func testUnboundBusinessFinalCannotBeReopenedByLaterLocalBinding() async throws {
+        let attributionId = "00000000-0000-4000-8000-000000000552"
+        var requestCount = 0
+        ServerLoginTruthURLProtocol.handler = { request in
+            requestCount += 1
+            return try Self.matchedFinalResponse(request, attributionId: attributionId, sequence: 1, share: "too-early")
+        }
+        let sdk = try makeSdk()
+        do {
+            _ = try await sdk.resolveInstallation()
+            XCTFail("账号未绑定时必须 fail-closed")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .invalidResponse)
+        }
+
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0552")
+        let outcome = try await sdk.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
+        XCTAssertEqual(outcome.phase, .stopped)
+        XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: "account_scope_0552"))
+        XCTAssertEqual(requestCount, 1, "事后绑定不得重新请求并认领已经越过本地边界的业务 FINAL")
+    }
+
+    func testCachedServerFinalRejectsDifferentLaterDecisionAndKeepsOriginalOutbox() async throws {
+        let attributionId = "00000000-0000-4000-8000-000000000553"
+        var requestCount = 0
+        ServerLoginTruthURLProtocol.handler = { request in
+            requestCount += 1
+            if requestCount == 1 {
+                return try Self.matchedFinalResponse(request, attributionId: attributionId, sequence: 2, share: "frozen")
+            }
+            var reopened = Self.matchedFinalObject(attributionId: attributionId, sequence: 2, share: "frozen")
+            reopened["decisionId"] = "20000000-0000-4000-8000-000000000553"
+            return try Self.response(request, body: reopened)
+        }
+        let sdk = try makeSdk()
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0553")
+        do {
+            _ = try await sdk.resolveInstallation()
+            XCTFail("业务 FINAL 应进入 outbox")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .businessDeliveryRequired)
+        }
+        do {
+            _ = try await sdk.getAttribution(attributionId: attributionId)
+            XCTFail("服务端 FINAL 不得以另一 decisionId 重开")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .invalidResponse)
+        }
+        XCTAssertEqual(
+            try sdk.pendingFinalDelivery(accountScope: "account_scope_0553")?.result.finalMatches.first?.externalIdentifier,
+            "frozen"
+        )
+    }
+
+    func testSdkKeyRotationKeepsLocalBindingAndStillUsesOnlyInstallationAndAttributionRoutes() async throws {
+        let attributionId = "00000000-0000-4000-8000-000000000554"
+        var observedKeys: [String] = []
+        ServerLoginTruthURLProtocol.handler = { request in
+            observedKeys.append(request.value(forHTTPHeaderField: "X-SDK-Key") ?? "")
             switch request.url?.path {
             case "/v1/sdk/installations/resolve":
-                let payload = try Self.payload(request)
-                installationIds.append(try XCTUnwrap(payload["eventId"] as? String))
-                return try Self.provisionalResponse(request, installationNumber: installationIds.count)
-            case "/v1/sdk/installations/user-provided-evidence":
-                evidenceCount += 1
-                if evidenceCount == 1 {
-                    return try Self.response(request, status: 503, body: ["error": "temporary"])
-                }
-                evidenceStarted.fulfill()
-                XCTAssertEqual(releaseEvidence.wait(timeout: .now() + 3), .success)
-                if evidenceStatus != 200 {
-                    return try Self.response(request, status: evidenceStatus, body: ["error": "temporary"])
-                }
-                return try Self.provisionalResponse(request, installationNumber: 1)
-            case "/v1/sdk/events/login-completed":
-                let payload = try Self.payload(request)
-                loginPayloads.append(payload)
-                guard let installationId = payload["installationEventId"] as? String,
-                      installationIds.contains(installationId) else {
-                    return try Self.response(request, status: 400, body: ["error": "installation not registered"])
-                }
-                return try Self.loginResponse(request)
+                return try Self.provisionalResponse(request, attributionId: attributionId, sequence: 1)
+            case "/v1/sdk/attributions/\(attributionId)":
+                return try Self.matchedFinalResponse(request, attributionId: attributionId, sequence: 2, share: "rotated-key")
             default:
-                XCTFail("unexpected request: \(request.url?.path ?? "missing")")
+                return try Self.response(request, status: 500, body: ["error": "unexpected"])
+            }
+        }
+
+        let first = try makeSdk(sdkKey: "ios-old-key")
+        try first.recordAuthenticatedLogin(accountScope: "account_scope_0554")
+        _ = try await first.resolveInstallation()
+        let rotated = try makeSdk(sdkKey: "ios-new-key")
+        let outcome = try await rotated.resumePendingAttribution(trigger: .networkAvailable, pollingTimeout: 0)
+
+        XCTAssertEqual(outcome.phase, .final)
+        XCTAssertEqual(observedKeys, ["ios-old-key", "ios-new-key"])
+        XCTAssertEqual(
+            try rotated.pendingFinalDelivery(accountScope: "account_scope_0554")?.result.finalMatches.first?.externalIdentifier,
+            "rotated-key"
+        )
+    }
+
+    func testClearGenerationDropsLateFinalAndPreservesReplacementBinding() async throws {
+        let oldAttributionId = "00000000-0000-4000-8000-000000000601"
+        let getStarted = expectation(description: "old attribution GET started")
+        let releaseGet = DispatchSemaphore(value: 0)
+        defer { releaseGet.signal() }
+        ServerLoginTruthURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/v1/sdk/installations/resolve":
+                return try Self.provisionalResponse(request, attributionId: oldAttributionId, sequence: 1)
+            case "/v1/sdk/attributions/\(oldAttributionId)":
+                getStarted.fulfill()
+                XCTAssertEqual(releaseGet.wait(timeout: .now() + 3), .success)
+                return try Self.matchedFinalResponse(request, attributionId: oldAttributionId, sequence: 2, share: "stale")
+            default:
                 return try Self.response(request, status: 500, body: ["error": "unexpected"])
             }
         }
 
         let sdk = try makeSdk()
-        let submission = await sdk.submitUserProvidedEvidence(.linkToken("pending_generation_token"))
-        XCTAssertEqual(submission, .deferred)
-        try sdk.recordAuthenticatedLogin(accountScope: "original_account_scope")
-        let originalState = try stateObject()
-        let oldRecovery = Task { try await sdk.retryPendingLoginConfirmation() }
-        await fulfillment(of: [evidenceStarted], timeout: 3)
+        try sdk.recordAuthenticatedLogin(accountScope: "account_scope_0601")
+        _ = try await sdk.resolveInstallation()
+        let oldTask = Task { try await sdk.getAttribution(attributionId: oldAttributionId) }
+        await fulfillment(of: [getStarted], timeout: 3)
 
         sdk.clearLocalState()
-        try sdk.recordAuthenticatedLogin(accountScope: "replacement_account_scope")
-        let replacementData = try stateData()
-        let replacementState = try stateObject()
-        XCTAssertNotEqual(originalState["eventId"] as? String, replacementState["eventId"] as? String)
-        releaseEvidence.signal()
+        try sdk.recordAuthenticatedLogin(accountScope: "replacement_scope_0601")
+        let replacement = try stateObject()
+        releaseGet.signal()
         do {
-            _ = try await oldRecovery.value
-            XCTFail("清理后的旧登录恢复必须取消，不能采用新安装")
-        } catch is CancellationError {
-            // 证据成功或临时失败都必须先检查原安装代次，不能越代次发送或写入发送标记。
-        } catch {
-            XCTFail("旧安装已清理，应返回 CancellationError，实际为 \(error)")
+            _ = try await oldTask.value
+            XCTFail("旧代次响应不得进入新安装")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .invalidResponse)
         }
 
-        XCTAssertTrue(loginPayloads.isEmpty, "旧任务不得为尚未登记的新安装发送登录")
-        XCTAssertEqual(try stateData(), replacementData, "新安装登录事实及发送标记必须保持逐字不变")
-        XCTAssertNil(try stateObject()["loginSubmissionAttemptedAt"])
-        XCTAssertNil(try stateObject()["loginConfirmation"])
-
-        // 新安装只能由新的恢复入口先登记安装，再发送其自己已经冻结的登录事实。
-        let confirmation = try await sdk.retryPendingLoginConfirmation()
-        XCTAssertNotNil(confirmation)
-        XCTAssertEqual(installationIds.count, 2)
-        XCTAssertEqual(loginPayloads.count, 1)
-        let login = try XCTUnwrap(loginPayloads.last)
-        XCTAssertEqual(login["installationEventId"] as? String, replacementState["eventId"] as? String)
-        XCTAssertEqual(login["eventId"] as? String, replacementState["loginEventId"] as? String)
-        XCTAssertEqual(login["occurredAt"] as? String, replacementState["loginOccurredAt"] as? String)
+        let current = try stateObject()
+        XCTAssertEqual(current["eventId"] as? String, replacement["eventId"] as? String)
+        XCTAssertEqual(current["deliveryAccountScope"] as? String, "replacement_scope_0601")
+        XCTAssertNil(current["attributionId"])
+        XCTAssertNil(current["terminalResult"])
     }
 
-    private func assertOriginalFactsAreRetained(evidenceRetryFails: Bool) async throws {
-        var installationCount = 0
-        var evidencePayloads: [[String: Any]] = []
-        var loginPayloads: [[String: Any]] = []
-        var order: [String] = []
-        LoginRecoveryURLProtocol.handler = { request in
-            switch request.url?.path {
-            case "/v1/sdk/installations/resolve":
-                installationCount += 1
-                return try Self.provisionalResponse(request, installationNumber: 1)
-            case "/v1/sdk/installations/user-provided-evidence":
-                order.append("evidence")
-                let payload = try Self.payload(request)
-                evidencePayloads.append(payload)
-                XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), payload["eventId"] as? String)
-                if evidencePayloads.count == 1 || (evidenceRetryFails && evidencePayloads.count == 2) {
-                    return try Self.response(request, status: 503, body: ["error": "temporary"])
-                }
-                return try Self.provisionalResponse(request, installationNumber: 1)
-            case "/v1/sdk/events/login-completed":
-                order.append("login")
-                let payload = try Self.payload(request)
-                loginPayloads.append(payload)
-                XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), payload["eventId"] as? String)
-                return try Self.loginResponse(request)
-            default:
-                XCTFail("unexpected request: \(request.url?.path ?? "missing")")
-                return try Self.response(request, status: 500, body: ["error": "unexpected"])
-            }
+    func testConsumableFinalWithoutLocalBindingFailsClosedButEmptyFinalRemainsDiagnostic() async throws {
+        let matchedId = "00000000-0000-4000-8000-000000000701"
+        ServerLoginTruthURLProtocol.handler = { request in
+            try Self.matchedFinalResponse(request, attributionId: matchedId, sequence: 1, share: "unbound")
         }
+        let matched = try makeSdk(storageNamespace: "server-truth-matched")
+        do {
+            _ = try await matched.resolveInstallation()
+            XCTFail("本地账号未绑定时不得接受可消费 FINAL")
+        } catch let error as LinkAttributionError {
+            XCTAssertEqual(error, .invalidResponse)
+        }
+        XCTAssertNil(try matched.pendingFinalDelivery(accountScope: "account_scope_0701"))
 
+        let emptyId = "00000000-0000-4000-8000-000000000702"
+        ServerLoginTruthURLProtocol.handler = { request in
+            try Self.emptyFinalResponse(request, attributionId: emptyId, outcome: "NO_MATCH", status: "NO_MATCH")
+        }
+        let empty = try makeSdk(storageNamespace: "server-truth-empty")
+        let result = try await empty.resolveInstallation()
+        XCTAssertTrue(result.isFinal)
+        XCTAssertEqual(result.outcome, .noMatch)
+        XCTAssertTrue(result.finalMatches.isEmpty)
+        XCTAssertNil(try empty.pendingFinalDelivery(accountScope: "account_scope_0702"))
+
+        let expiredId = "00000000-0000-4000-8000-000000000703"
+        ServerLoginTruthURLProtocol.handler = { request in
+            try Self.emptyFinalResponse(request, attributionId: expiredId, outcome: "EXPIRED", status: "EXPIRED")
+        }
+        let expired = try makeSdk(storageNamespace: "server-truth-expired")
+        let expiredResult = try await expired.resolveInstallation()
+        XCTAssertEqual(expiredResult.outcome, .expired)
+        XCTAssertTrue(expiredResult.finalMatches.isEmpty)
+        XCTAssertNil(try expired.pendingFinalDelivery(accountScope: "account_scope_0703"))
+    }
+
+    func testV3MigrationRevokesMobileConfirmationAndSuppressesHistoricalBusinessFinal() throws {
+        let accountScope = "account_scope_0801"
         let sdk = try makeSdk()
-        let submission = await sdk.submitUserProvidedEvidence(.linkToken("pending_original_token"))
-        XCTAssertEqual(submission, .deferred)
-        try sdk.recordAuthenticatedLogin(accountScope: "original_account_scope")
-        let originalState = try stateObject()
-        let pendingEvidence = try XCTUnwrap(originalState["pendingUserProvidedEvidence"] as? [String: Any])
+        try sdk.recordAuthenticatedLogin(accountScope: accountScope)
+        var legacy = try stateObject()
+        var final = Self.matchedFinalObject(
+            attributionId: "00000000-0000-4000-8000-000000000801",
+            sequence: 9,
+            share: "legacy-mobile-confirmed"
+        )
+        final.removeValue(forKey: "decisionId")
+        legacy["storageVersion"] = 3
+        legacy["attributionId"] = final["attributionId"]
+        legacy["terminalResult"] = final
+        legacy["pendingLoginFinal"] = final
+        legacy["loginSubmissionAttemptedAt"] = "2026-08-30T08:00:01Z"
+        legacy["loginConfirmation"] = [
+            "confirmationId": "00000000-0000-4000-8000-000000000899",
+            "status": "RECORDED",
+            "source": "LEGACY_MOBILE",
+            "occurredAt": "2026-08-30T08:00:00Z",
+            "reportedAt": "2026-08-30T08:00:01Z",
+        ]
+        legacy["loginConfirmationPermanentlyRejected"] = true
+        legacy["loginRejectionCredentialScope"] = "legacy"
+        legacy["recoveryPermanentlyStopped"] = true
+        legacy["recoveryCredentialScope"] = "legacy"
 
-        if evidenceRetryFails {
-            do {
-                _ = try await sdk.retryPendingLoginConfirmation()
-                XCTFail("证据仍未成功时不得先发送登录")
-            } catch let error as LinkAttributionError {
-                XCTAssertEqual(error, .network("pending_user_evidence"))
-            }
-            XCTAssertTrue(loginPayloads.isEmpty)
-            let waitingState = try stateObject()
-            for field in ["eventId", "occurredAt", "loginEventId", "loginOccurredAt"] {
-                XCTAssertEqual(waitingState[field] as? String, originalState[field] as? String)
-            }
-            XCTAssertNil(waitingState["loginSubmissionAttemptedAt"])
-            XCTAssertEqual(waitingState["loginConfirmationPermanentlyRejected"] as? Bool, false)
-            let waitingEvidence = try XCTUnwrap(waitingState["pendingUserProvidedEvidence"] as? [String: Any])
-            XCTAssertEqual(waitingEvidence["eventId"] as? String, pendingEvidence["eventId"] as? String)
-            XCTAssertEqual(waitingEvidence["occurredAt"] as? String, pendingEvidence["occurredAt"] as? String)
-        }
+        let currentKey = try storageKey(suffix: ".installation.v4")
+        let legacyKey = currentKey.replacingOccurrences(of: ".installation.v4", with: ".installation.v3")
+        defaults.removeObject(forKey: currentKey)
+        defaults.set(try JSONSerialization.data(withJSONObject: legacy), forKey: legacyKey)
 
-        try await Task.sleep(nanoseconds: 5_000_000)
-        let recoveringSdk = evidenceRetryFails ? try makeSdk() : sdk
-        let confirmation = try await recoveringSdk.retryPendingLoginConfirmation()
-        XCTAssertNotNil(confirmation)
-        XCTAssertEqual(installationCount, 1)
-        XCTAssertEqual(loginPayloads.count, 1)
-        XCTAssertEqual(order, evidenceRetryFails ? ["evidence", "evidence", "evidence", "login"] : ["evidence", "evidence", "login"])
-        for payload in evidencePayloads {
-            XCTAssertEqual(payload["installationEventId"] as? String, originalState["eventId"] as? String)
-            XCTAssertEqual(payload["eventId"] as? String, pendingEvidence["eventId"] as? String)
-            XCTAssertEqual(payload["occurredAt"] as? String, pendingEvidence["occurredAt"] as? String)
-        }
-        XCTAssertNotEqual(evidencePayloads.first?["reportedAt"] as? String, evidencePayloads.last?["reportedAt"] as? String)
-        let login = try XCTUnwrap(loginPayloads.first)
-        XCTAssertEqual(login["installationEventId"] as? String, originalState["eventId"] as? String)
-        XCTAssertEqual(login["eventId"] as? String, originalState["loginEventId"] as? String)
-        XCTAssertEqual(login["occurredAt"] as? String, originalState["loginOccurredAt"] as? String)
-        XCTAssertNil(try stateObject()["pendingUserProvidedEvidence"])
+        let migratedSDK = try makeSdk()
+        XCTAssertTrue(migratedSDK.hasRecordedLoginCompletedFact)
+        let migrated = try stateObject()
+        XCTAssertEqual(migrated["storageVersion"] as? Int, 4)
+        XCTAssertNil(migrated["loginConfirmation"])
+        XCTAssertNil(migrated["pendingLoginFinal"])
+        XCTAssertNil(migrated["loginSubmissionAttemptedAt"])
+        XCTAssertEqual(migrated["loginConfirmationPermanentlyRejected"] as? Bool, false)
+        XCTAssertNil(migrated["loginRejectionCredentialScope"])
+        XCTAssertEqual(migrated["recoveryPermanentlyStopped"] as? Bool, false)
+        XCTAssertNil(migrated["terminalResult"], "缺少 decisionId 的旧业务 FINAL 只能保留抑制账本，不能继续作为可提交结果")
+        XCTAssertEqual(
+            migrated["suppressedUnboundDeliveryId"] as? String,
+            "00000000-0000-4000-8000-000000000801:9"
+        )
+        XCTAssertNil(try migratedSDK.pendingFinalDelivery(accountScope: accountScope))
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains(legacyKey))
     }
 
-    private func makeSdk() throws -> LinkAttribution {
-        let sessionConfiguration = URLSessionConfiguration.ephemeral
-        sessionConfiguration.protocolClasses = [LoginRecoveryURLProtocol.self]
+    private func makeSdk(
+        storageNamespace: String = "server-login-truth-tests",
+        sdkKey: String = "ios-test-key"
+    ) throws -> LinkAttribution {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ServerLoginTruthURLProtocol.self]
         return try LinkAttribution(
             configuration: .init(
                 apiBaseURL: URL(string: "https://api.example.test")!,
-                sdkKey: "ios-test-key",
+                sdkKey: sdkKey,
                 appVersion: "2.10.4",
                 cacheScope: "project-a/test/ios",
-                storageNamespace: "login-generation-tests",
+                storageNamespace: storageNamespace,
                 userProvidedEvidenceEnabled: true
             ),
-            session: URLSession(configuration: sessionConfiguration),
+            session: URLSession(configuration: configuration),
             userDefaults: defaults
         )
     }
 
+    private func storageKey(suffix: String = ".installation.v4") throws -> String {
+        try XCTUnwrap(defaults.dictionaryRepresentation().keys.first { $0.hasSuffix(suffix) })
+    }
+
     private func stateData() throws -> Data {
-        let key = try XCTUnwrap(defaults.dictionaryRepresentation().keys.first { $0.hasSuffix(".installation.v3") })
-        return try XCTUnwrap(defaults.data(forKey: key))
+        try XCTUnwrap(defaults.data(forKey: storageKey()))
     }
 
     private func stateObject() throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: stateData()) as? [String: Any])
     }
 
-    private static func provisionalResponse(_ request: URLRequest, installationNumber: Int) throws -> (HTTPURLResponse, Data) {
+    private static func provisionalResponse(
+        _ request: URLRequest,
+        attributionId: String,
+        sequence: Int
+    ) throws -> (HTTPURLResponse, Data) {
         try response(request, body: [
-            "attributionId": "00000000-0000-4000-8000-00000000027\(installationNumber)",
-            "processState": "PROVISIONAL", "isFinal": false, "status": "PENDING", "outcome": NSNull(),
-            "resolverType": "IOS_PROBABILISTIC_INSTALL", "decisionSequence": 0,
-            "occurredAt": "2026-08-27T08:00:00Z", "reportedAt": "2026-08-27T08:00:01Z",
-            "finalizedAt": NSNull(), "retryAfterMs": 1_000, "finalMatches": [], "matches": [], "matchCount": 0,
+            "attributionId": attributionId,
+            "decisionId": decisionId(for: attributionId),
+            "processState": "PROVISIONAL",
+            "isFinal": false,
+            "outcome": NSNull(),
+            "status": "PENDING",
+            "resolverType": "IOS_PROBABILISTIC_INSTALL",
+            "decisionSequence": sequence,
+            "occurredAt": "2026-08-30T08:00:00Z",
+            "reportedAt": "2026-08-30T08:00:01Z",
+            "finalizedAt": NSNull(),
+            "retryAfterMs": 1,
+            "finalMatches": [],
+            "matches": [],
+            "matchCount": 0,
         ])
     }
 
-    private static func loginResponse(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
-        try response(request, status: 201, body: [
-            "confirmationId": "00000000-0000-4000-8000-000000000177", "status": "RECORDED", "source": "SDK_REPORTED",
-            "occurredAt": "2026-08-27T08:01:00Z", "reportedAt": "2026-08-27T08:01:01Z",
+    private static func matchedFinalResponse(
+        _ request: URLRequest,
+        attributionId: String,
+        sequence: Int,
+        share: String
+    ) throws -> (HTTPURLResponse, Data) {
+        try response(request, body: matchedFinalObject(attributionId: attributionId, sequence: sequence, share: share))
+    }
+
+    private static func matchedFinalObject(
+        attributionId: String,
+        sequence: Int,
+        share: String
+    ) -> [String: Any] {
+        let match: [String: Any] = [
+            "linkId": "00000000-0000-4000-8000-000000000901",
+            "ruleKey": "icard_share",
+            "externalIdentifier": share,
+            "confidenceBand": "HIGH",
+            "route": "/card/1",
+            "attributedAt": "2026-08-30T08:00:02Z",
+        ]
+        return [
+            "attributionId": attributionId,
+            "decisionId": decisionId(for: attributionId),
+            "processState": "FINAL",
+            "isFinal": true,
+            "outcome": "MATCHED",
+            "status": "PROBABILISTIC_MATCH",
+            "resolverType": "IOS_PROBABILISTIC_INSTALL",
+            "decisionSequence": sequence,
+            "occurredAt": "2026-08-30T08:00:00Z",
+            "reportedAt": "2026-08-30T08:00:02Z",
+            "finalizedAt": "2026-08-30T08:00:02Z",
+            "retryAfterMs": 0,
+            "finalMatches": [match],
+            "matches": [match],
+            "matchCount": 1,
+        ]
+    }
+
+    private static func emptyFinalResponse(
+        _ request: URLRequest,
+        attributionId: String,
+        outcome: String,
+        status: String
+    ) throws -> (HTTPURLResponse, Data) {
+        try response(request, body: [
+            "attributionId": attributionId,
+            "decisionId": decisionId(for: attributionId),
+            "processState": "FINAL",
+            "isFinal": true,
+            "outcome": outcome,
+            "status": status,
+            "resolverType": "IOS_PROBABILISTIC_INSTALL",
+            "decisionSequence": 1,
+            "occurredAt": "2026-08-30T08:00:00Z",
+            "reportedAt": "2026-08-30T08:00:02Z",
+            "finalizedAt": "2026-08-30T08:00:02Z",
+            "retryAfterMs": 0,
+            "finalMatches": [],
+            "matches": [],
+            "matchCount": 0,
         ])
     }
 
-    private static func response(_ request: URLRequest, status: Int = 200, body: [String: Any]) throws -> (HTTPURLResponse, Data) {
-        let response = try XCTUnwrap(HTTPURLResponse(
-            url: try XCTUnwrap(request.url), statusCode: status, httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
-        ))
+    private static func decisionId(for installInstanceId: String) -> String {
+        "10000000-0000-4000-8000-\(installInstanceId.suffix(12))"
+    }
+
+    private static func response(
+        _ request: URLRequest,
+        status: Int = 200,
+        body: [String: Any]
+    ) throws -> (HTTPURLResponse, Data) {
+        let response = try XCTUnwrap(
+            HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: status,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )
+        )
         return (response, try JSONSerialization.data(withJSONObject: body))
-    }
-
-    private static func payload(_ request: URLRequest) throws -> [String: Any] {
-        if let body = request.httpBody {
-            return try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        }
-        let stream = try XCTUnwrap(request.httpBodyStream)
-        stream.open()
-        defer { stream.close() }
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 1_024)
-        while stream.hasBytesAvailable {
-            let count = stream.read(&buffer, maxLength: buffer.count)
-            if count <= 0 { break }
-            data.append(buffer, count: count)
-        }
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 }
 
-private final class LoginRecoveryURLProtocol: URLProtocol {
+private final class ServerLoginTruthURLProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
     override class func canInit(with request: URLRequest) -> Bool { true }

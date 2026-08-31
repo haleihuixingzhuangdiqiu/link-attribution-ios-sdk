@@ -32,7 +32,14 @@ if let result = try await sdk.handle(userActivity: userActivity) {
 // 首次启动旁路执行；归因临时失败、配置错误或业务 FINAL 待交付都不能中断 App 启动。
 Task {
     do {
-        _ = try await sdk.resolveInstallation()
+        let attribution = try await sdk.resolveInstallation()
+        if attribution.decisionSequence > 0, let decisionId = attribution.decisionId {
+            // 只把这两个平台定位值随真实业务登录请求交给业务后端；App 不持有 Server Key。
+            businessLoginDraft.attributionReference = .init(
+                installInstanceId: attribution.attributionId,
+                decisionId: decisionId
+            )
+        }
     } catch is CancellationError {
         // 宿主生命周期取消保持原语义，不改写为归因失败。
     } catch {
@@ -48,7 +55,7 @@ do {
     // 归因本地缓存异常不回滚、不阻塞已经成功的业务登录。
 }
 
-// 宿主只转发生命周期/网络信号；SDK 统一恢复主动证据、登录事实、安装查询和 FINAL 轮询。
+// 宿主只转发生命周期/网络信号；SDK 统一恢复主动证据、安装查询和同一 attribution 的 FINAL 轮询。
 Task {
     do {
         let recovery = try await sdk.resumePendingAttribution(
@@ -66,10 +73,13 @@ Task {
 }
 
 // SDK 把全部 FINAL.finalMatches 作为一条本地 outbox 记录交付，不替业务挑一个候选。
-if let delivery = try sdk.pendingFinalDelivery(accountScope: localOpaqueAccountScope) {
+if let delivery = try sdk.pendingFinalDelivery(accountScope: localOpaqueAccountScope),
+   let decisionId = delivery.result.decisionId {
     try await businessBackend.processAttribution(
-        // 业务后端应使用 Server Key 重读该 attributionId 的不可变 FINAL，不能信任客户端自报奖励对象。
-        attributionId: delivery.result.attributionId
+        // attributionId 是 installInstanceId；decisionId 是精确 Decision，二者不能互换。
+        // 业务后端应使用 Server Key 重读该 Decision，不能信任客户端自报奖励对象。
+        installInstanceId: delivery.result.attributionId,
+        decisionId: decisionId
     )
     // 只有业务后端真实处理成功后才 ack；展示 Toast 或收到 FINAL 都不等于业务成功。
     try sdk.acknowledgeFinalDelivery(
@@ -83,16 +93,18 @@ if let delivery = try sdk.pendingFinalDelivery(accountScope: localOpaqueAccountS
 
 ## 持久恢复与 FINAL 交付
 
-- `recordAuthenticatedLogin(accountScope:)` 必须在真实登录成功并落库后的同步回调中执行；它在同一临界区绑定本地脱敏账号作用域并冻结随机 `eventId + occurredAt`，不触网、不读取或上传账号。旧的拆分入口仅为源码兼容保留，容易在两次调用之间留下杀进程窗口，新接入不得继续使用。
-- 登录 POST 在服务端成功但响应丢失时，SDK 会用相同 `eventId + occurredAt` 幂等重放，并只刷新 `reportedAt`。期间看到的同一不可变 FINAL 只进入隔离区，登录确认恢复后才进入账号 outbox；从未有本地登录事实的提前业务 FINAL 会永久 fail-closed。
-- `resumePendingAttribution(trigger:pollingTimeout:)` 是可选的统一恢复入口。宿主只转发 App 启动、前台、网络恢复和定时信号；SDK 内部按“用户主动证据 → 登录事实 → 安装查询 → FINAL”排序。临时失败使用 1 秒起步、最多 5 分钟、带抖动的跨进程指数退避；冷启动遵守既有退避，真实前台/网络恢复可提前唤醒一次。
+- `recordAuthenticatedLogin(accountScope:)` 必须在真实登录成功并落库后的同步回调中执行；它在同一临界区绑定本地脱敏账号作用域并冻结随机本地 `eventId + occurredAt`，不触网、不读取或上传账号。平台只信任业务后端用 Server Key 上报的 `SERVER_CONFIRMED` 登录事实，移动端不能上报或解锁登录门槛。
+- App 在登录请求前从非 FINAL `AttributionResult` 读取 `attributionId + decisionId`，只把这两个平台定位值随业务登录 claim 交给业务后端；业务后端在自身登录事务提交后用 Server Key 确认。若期间 Worker 已推进 Decision，平台只接受同安装、同冻结策略且 sequence 连续、未跨 FINAL 的 supplied 祖先，并在账本保留 supplied ID；断链或策略漂移失败关闭。App 不生成登录证明，也不接触 Server Key。
+- `trackLoginCompleted()`、`retryPendingLoginConfirmation()`、`recordLoginCompletedOccurrence()` 和 `bindAuthenticatedAccount(scope:)` 仅为源码/ABI 兼容保留：前者返回稳定停用错误，重试固定返回 `nil`，拆分式同步入口固定拒绝；四者都不触网、不改写本地登录事实。新接入只调用原子 `recordAuthenticatedLogin(accountScope:)`。
+- `resumePendingAttribution(trigger:pollingTimeout:)` 是可选的统一恢复入口。宿主只转发 App 启动、前台、网络恢复和定时信号；SDK 内部按“用户主动证据 → 安装查询 → 同一 attribution 的 FINAL 轮询”排序。临时失败使用 1 秒起步、最多 5 分钟、带抖动的跨进程指数退避；冷启动遵守既有退避，真实前台/网络恢复可提前唤醒一次。
 - 同一 `storageNamespace + 规范 API origin + 规范 cacheScope` 的多个 SDK 实例共享进程内状态锁、请求门禁和恢复门禁；API origin 会统一 scheme/host 大小写、默认端口和尾部斜杠，`cacheScope` 会去除首尾空白，等价配置不会分裂出两次安装。状态中同时保存完整规范作用域，哈希键碰撞或配置漂移时 fail-closed。即使宿主为同一 suite 创建多个 `UserDefaults` 对象，也不会把一次失败重复计成多次退避。`clearLocalState()` 会切换本地安装代次，所有迟到请求或完整性结果都不得复活、发送或改写旧代次。
-- 当前本地状态为显式 v3。首次建档会在任何网络请求前一起冻结 `eventId + occurredAt + IOS + appVersion + 无 deterministicClickToken`；安装响应丢失后即使 App 已升级，POST 正文和 `X-App-Version` 仍逐字复用首次版本。旧 v1/v2 只有在已有 `attributionId`、能够证明平台已经登记安装时才迁移；无法还原首次请求身份的旧待发送状态或任何核心字段损坏都会返回稳定 `storage` 错误，绝不删除后伪造新安装。
+- 当前本地状态为显式 v4。首次建档会在任何网络请求前一起冻结 `eventId + occurredAt + IOS + appVersion + 无 deterministicClickToken`；安装响应丢失后即使 App 已升级，POST 正文和 `X-App-Version` 仍逐字复用首次版本。v3 迁移会清除历史移动端登录确认、待解封 FINAL 与登录永久拒绝；历史可消费 FINAL 会标记为不可再次交付。旧 v1/v2 只有在已有 `attributionId`、能够证明平台已经登记安装时才迁移；无法还原首次请求身份的旧待发送状态或任何核心字段损坏都会返回稳定 `storage` 错误，绝不删除后伪造新安装。
 - 只有网络、超时、HTTP 408/425/429/5xx 自动重试。鉴权、参数、契约和普通 409 属于永久失败，自动恢复会跨进程停止；修复配置或升级 SDK 后才能显式调用 `resetAutomaticRecovery()`。
-- `pendingFinalDelivery(accountScope:)` 只返回已登录、已绑定同一账号、尚未 ack 的 `MATCHED/MULTIPLE_MATCHES` FINAL。`deliveryId` 由 `attributionId + decisionSequence` 稳定生成，重启后不丢失；无匹配、过期等 FINAL 仅供诊断，不进入业务 outbox。
+- `pendingFinalDelivery(accountScope:)` 只返回本地原子绑定同一账号、由业务后端 Server Key 确认后在平台形成、且尚未 ack 的 `MATCHED/MULTIPLE_MATCHES` FINAL。`deliveryId` 由 `attributionId + decisionSequence` 稳定生成，重启后不丢失；`NO_MATCH/EXPIRED` 等空 FINAL 不要求本地账号绑定，仅供诊断，不进入业务 outbox。
+- `AttributionResult.attributionId` 是安装实例定位值，即 Server Key 契约的 `installInstanceId`；`decisionId` 是当前精确 Decision，二者都是 UUID 且不得互换。Decision 尚未创建时 `decisionId` 为空；一旦 `decisionSequence > 0`，网络响应必须携带它。旧缓存缺失 `decisionId` 的业务 FINAL 不会进入 outbox，也不能提交给业务后端。
 - `resolveInstallation`、`getAttribution` 和 `waitForAttribution` 遇到含分享码的可消费 FINAL 时抛出稳定的 `businessDeliveryRequired`，`resumePendingAttribution` 返回 `.final` 但不附带结果；完整多候选只能从账号绑定的 `pendingFinalDelivery` 读取，避免旧查询入口绕过账号边界。
-- `accountScope` 仅存本机并且首次绑定后禁止换绑；应由宿主把内部账号 ID 转成不可逆、非明文、至少 16 字符的稳定作用域。账号绑定前形成的可消费 FINAL 会 fail-closed，不允许事后认领给任意账号。
-- FINAL 是不可变历史。登录或主动证据只能推动尚未 FINAL 的会话；终态后的主动证据返回拒绝且不触网。
+- `accountScope` 仅存本机并且首次绑定后禁止换绑；应由宿主把内部账号 ID 转成不可逆、非明文、至少 16 字符的稳定作用域。账号绑定前形成的可消费 FINAL 会 fail-closed，不允许事后认领给任意账号；历史移动端确认也不能替代这一绑定。
+- FINAL Decision/Match 是不可变历史。用户明确提交的主动证据在本机已有可信登录绑定时仍可于资格窗内持久上报，平台再独立校验 Server Key 登录链并进入 reconciliation；SDK 保留原 FINAL/outbox，不把对账产生的新 Decision 直接交给移动端、回滚或重复发放权益。未绑定、历史越权 FINAL 或普通后台流程仍不得在终态后自动补造证据。
 - `apiBaseURL` 必须是纯 HTTP(S) origin，不能带业务路径、userinfo、query 或 fragment；非 localhost 必须 HTTPS。SDK 禁止 HTTP 重定向并校验最终响应仍为配置的同 origin；归因 GET 强制绕过本地 URL 缓存并发送 `no-store`，避免旧决策或 SDK Key 被重定向、缓存复用。
 - 2xx 响应必须显式使用 `application/json` 或 `application/*+json`、正文必须是合法 UTF-8 且不得超过 2 MiB；错误 MIME、超限、非法编码或模型契约不一致统一返回 `invalidResponse`，不会把服务端正文透传给业务或日志。
 
@@ -121,8 +133,8 @@ SDK 在每次 `/v1/sdk/*` 请求发送 `X-App-Version`；首次安装请求体�
 ## 隐私与 App Store 申报
 
 - SDK 不读取 IDFA、IDFV、定位、通讯录、相册、剪贴板或精确硬件标识，也不生成稳定设备指纹。
-- 登录确认请求只包含安装随机事件 ID、独立幂等事件 ID、`occurredAt`（真实登录成功时间）和 `reportedAt`（本次上报时间）；不包含账号、业务 Token、用户 ID 或设备稳定标识。SDK 持久化首次 `occurredAt`，重试保持它不变并刷新 `reportedAt`；服务端校验时间边界并返回冻结的发生时间与服务端接收时间。
-- 默认首启信号只有主语言（如 `zh`）、系统主版本、设备大类和请求侧生成的项目级短期网络摘要；国家/地区和时区默认不采集。
+- iOS SDK 不发送登录确认请求。本地只保存随机回调事件 ID、真实登录发生时间和脱敏 `accountScope`，这些字段不上传；业务后端使用 Server Key 发送 `SERVER_CONFIRMED` 事实，平台据此推动同一 attribution 形成 FINAL。
+- 默认首启信号只有主语言（如 `zh`）、系统主版本、设备大类、`COMPACT / MEDIUM / EXPANDED / LARGE` 固定 point 宽度区间和请求侧生成的项目级短期网络摘要；国家/地区和时区默认不采集。SDK 不发送原始屏幕尺寸、scale、分辨率或设备型号。
 - 随包提供 `PrivacyInfo.xcprivacy`：声明产品交互、其他粗粒度归因数据，以及仅供 SDK 自身缓存使用的 `UserDefaults`（`CA92.1`）。宿主 App 仍须在 App Store Connect 中按实际用途合并申报自身及全部第三方 SDK 的数据实践。
 - 平台默认把原始粗粒度信号保留 24 小时并由 Worker 清除；网络地址不会原文入库，而是使用租户、项目和服务端密钥域隔离的 HMAC 摘要。
 - 业务链接会完整发送给平台解析。链接路径或 Query 中不得放手机号、邮箱、姓名、账户 ID 等个人或敏感信息；应只放短期随机业务标识，再由业务后端受控换取数据。

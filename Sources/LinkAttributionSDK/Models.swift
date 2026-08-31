@@ -161,7 +161,10 @@ public struct AttributionResult: Codable, Equatable, Sendable {
     /// 与平台策略 `maximumCandidates` 的公开上限保持一致。
     private static let maximumFinalMatches = 100
 
+    /// 当前安装实例 ID；提交 Server Key 登录确认时作为 `installInstanceId`，不得与 `decisionId` 混用。
     public let attributionId: String
+    /// 当前追加式 Decision 的精确 ID；尚未创建 Decision 时为空，不能用 `attributionId` 代替。
+    public let decisionId: String?
     public let processState: AttributionProcessState
     public let outcome: AttributionOutcome?
     public let status: AttributionStatus
@@ -194,7 +197,7 @@ public struct AttributionResult: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case attributionId, processState, isFinal, outcome, status, resolverType, finalMatches, matches, matchCount, decisionSequence
+        case attributionId, decisionId, processState, isFinal, outcome, status, resolverType, finalMatches, matches, matchCount, decisionSequence
         case occurredAt, reportedAt, finalizedAt, retryAfterMs
         case linkId, route, navigationSessionId, schemaVersion, params, attributedAt
     }
@@ -202,6 +205,8 @@ public struct AttributionResult: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         attributionId = try container.decode(String.self, forKey: .attributionId)
+        let hasDecisionId = container.contains(.decisionId)
+        decisionId = try container.decodeIfPresent(String.self, forKey: .decisionId)
         processState = try container.decode(AttributionProcessState.self, forKey: .processState)
         let wireIsFinal: Bool
         if container.contains(.isFinal) {
@@ -301,8 +306,13 @@ public struct AttributionResult: Codable, Equatable, Sendable {
         guard finalMatches.count <= Self.maximumFinalMatches else {
             throw DecodingError.dataCorruptedError(forKey: .finalMatches, in: container, debugDescription: "finalMatches exceeds the public delivery limit")
         }
-        guard Self.isValidUUID(attributionId), finalMatches.allSatisfy({ Self.isValidUUID($0.linkId) }) else {
-            throw DecodingError.dataCorruptedError(forKey: .finalMatches, in: container, debugDescription: "attributionId and final match linkId must use UUID format")
+        guard Self.isValidUUID(attributionId), decisionId.map(Self.isValidUUID) ?? true,
+              finalMatches.allSatisfy({ Self.isValidUUID($0.linkId) }) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .decisionId,
+                in: container,
+                debugDescription: "installInstanceId, decisionId and final match linkId must use UUID format"
+            )
         }
         guard finalMatches.allSatisfy({ match in
             match.ruleKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -324,6 +334,21 @@ public struct AttributionResult: Codable, Equatable, Sendable {
         }
         if decisionSequence < 0 || processState == .final && decisionSequence < 1 {
             throw DecodingError.dataCorruptedError(forKey: .decisionSequence, in: container, debugDescription: "decisionSequence is outside the public contract")
+        }
+        if decisionSequence == 0, hasDecisionId {
+            throw DecodingError.dataCorruptedError(
+                forKey: .decisionId,
+                in: container,
+                debugDescription: "decisionId must be absent before the first persisted Decision"
+            )
+        }
+        if decisionSequence > 0,
+           decisionId == nil,
+           decoder.userInfo[.allowsLegacyAttributionCache] as? Bool != true {
+            throw DecodingError.keyNotFound(
+                CodingKeys.decisionId,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "a persisted platform Decision requires decisionId")
+            )
         }
         guard Self.isValidInstant(occurredAt), Self.isValidInstant(reportedAt), finalizedAt.map(Self.isValidInstant) ?? true else {
             throw DecodingError.dataCorruptedError(forKey: .occurredAt, in: container, debugDescription: "attribution timestamps must use RFC3339")
@@ -354,6 +379,7 @@ public struct AttributionResult: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(attributionId, forKey: .attributionId)
+        try container.encodeIfPresent(decisionId, forKey: .decisionId)
         try container.encode(processState, forKey: .processState)
         try container.encode(isFinal, forKey: .isFinal)
         try container.encode(outcome, forKey: .outcome)
@@ -375,14 +401,71 @@ public struct AttributionResult: Codable, Equatable, Sendable {
         try container.encodeIfPresent(attributedAt, forKey: .attributedAt)
     }
 
-    /// 接受带或不带毫秒的小写/大写时区 RFC3339；拒绝本地时区字符串和无法解析的自由文本。
+    /// 严格校验 RFC3339 日历值，不使用会把非法日期、24:00 或越界时区静默滚动的 Foundation 日期解析器。
     private static func isValidInstant(_ value: String) -> Bool {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if fractional.date(from: value) != nil { return true }
-        let seconds = ISO8601DateFormatter()
-        seconds.formatOptions = [.withInternetDateTime]
-        return seconds.date(from: value) != nil
+        let bytes = Array(value.utf8)
+        guard bytes.count >= 20,
+              bytes[4] == 45,
+              bytes[7] == 45,
+              bytes[10] == 84,
+              bytes[13] == 58,
+              bytes[16] == 58,
+              let year = decimal(bytes, at: 0, length: 4),
+              let month = decimal(bytes, at: 5, length: 2),
+              let day = decimal(bytes, at: 8, length: 2),
+              let hour = decimal(bytes, at: 11, length: 2),
+              let minute = decimal(bytes, at: 14, length: 2),
+              let second = decimal(bytes, at: 17, length: 2) else {
+            return false
+        }
+
+        let leapYear = year.isMultiple(of: 4) && (!year.isMultiple(of: 100) || year.isMultiple(of: 400))
+        let daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        guard month >= 1,
+              month <= 12,
+              day >= 1,
+              day <= daysInMonth[month - 1],
+              hour <= 23,
+              minute <= 59,
+              second <= 59 else {
+            return false
+        }
+
+        var zoneStart = 19
+        if bytes[zoneStart] == 46 {
+            let fractionStart = zoneStart + 1
+            var fractionEnd = fractionStart
+            while fractionEnd < bytes.count, bytes[fractionEnd] >= 48, bytes[fractionEnd] <= 57 {
+                fractionEnd += 1
+            }
+            let fractionLength = fractionEnd - fractionStart
+            guard fractionLength >= 1, fractionLength <= 9 else { return false }
+            zoneStart = fractionEnd
+        }
+
+        guard zoneStart < bytes.count else { return false }
+        if bytes[zoneStart] == 90 {
+            return zoneStart + 1 == bytes.count
+        }
+        guard zoneStart + 6 == bytes.count,
+              bytes[zoneStart] == 43 || bytes[zoneStart] == 45,
+              bytes[zoneStart + 3] == 58,
+              let offsetHour = decimal(bytes, at: zoneStart + 1, length: 2),
+              let offsetMinute = decimal(bytes, at: zoneStart + 4, length: 2) else {
+            return false
+        }
+        return offsetHour <= 23 && offsetMinute <= 59
+    }
+
+    private static func decimal(_ bytes: [UInt8], at start: Int, length: Int) -> Int? {
+        guard start >= 0, length > 0, start + length <= bytes.count else { return nil }
+        var value = 0
+        for index in start ..< (start + length) {
+            let byte = bytes[index]
+            guard byte >= 48, byte <= 57 else { return nil }
+            value = value * 10 + Int(byte - 48)
+        }
+        return value
     }
 
     /// 服务端公开 ID 均使用规范 UUID；拒绝空白、花括号和其他看似可解析但不属于公开 wire 的形式。
@@ -409,7 +492,7 @@ public enum IOSUserProvidedEvidence: Equatable, Sendable {
     case externalIdentifier(ruleKey: String, externalIdentifier: String)
 }
 
-/// 用户主动粘贴证据属于可跳过旁路；只允许在归因冻结前补强，FINAL 后拒绝且不会触网。
+/// 用户主动粘贴证据属于可跳过旁路。归因冻结前可补强当前求值；已有可信本地账号绑定的 FINAL 后提交只进入独立 reconciliation。
 public enum IOSUserProvidedEvidenceSubmission: Equatable, Sendable {
     case disabled
     case rejected
@@ -417,9 +500,11 @@ public enum IOSUserProvidedEvidenceSubmission: Equatable, Sendable {
     /**
      平台已幂等受理该证据。
 
-     受理响应使用完整 AttributionResult wire，但 SDK 不从该 POST 直接交付业务结果。新证据会
-     触发同一 attribution 的后续求值；调用方统一通过 `resolveInstallation()`、
-     `resumePendingAttribution(...)` 或 `getAttribution(attributionId:)` 获取并持久化 FINAL。
+     受理响应使用完整 AttributionResult wire，但 SDK 不从该 POST 直接交付业务结果。冻结前的新证据会
+     触发同一 attribution 的后续求值，调用方统一通过 `resolveInstallation()`、
+     `resumePendingAttribution(...)` 或 `getAttribution(attributionId:)` 获取并持久化 FINAL。已有可信本地
+     账号绑定的 FINAL 后受理仅表示平台创建了独立 reconciliation receipt；SDK 保持原 FINAL 与 outbox
+     不变，也不向移动端交付对账产生的新 Decision。
      */
     case accepted
 }
@@ -467,19 +552,13 @@ public struct NavigationOutcomeResult: Codable, Equatable, Sendable {
     public let reportedAt: String?
 }
 
-/**
- 宿主真实登录成功后登记的首次登录事实。
-
- SDK 在登录成功时持久化 `occurredAt`，网络重试保持它不变并刷新 `reportedAt`；
- 服务端校验时间边界后冻结首次事实，响应返回冻结的发生时间和服务端接收时间。
- 该契约不包含账号、业务 Token、用户 ID 或稳定设备标识。
- */
+/// 仅为 0.1.x 源码/ABI 与旧缓存迁移保留；移动端登录确认已停用，SDK 不再生成或接受该网络模型。
 public struct LoginConfirmation: Codable, Equatable, Sendable {
-    /// 服务端生成的登录确认记录 ID。
+    /// 历史服务端记录 ID；当前 SDK 不再返回该类型的实例。
     public let confirmationId: String
     /// 服务端稳定状态，当前成功值为 `RECORDED`。
     public let status: String
-    /// 登录事实来源，当前 SDK 上报值为 `SDK_REPORTED`。
+    /// 历史来源值；不构成当前信任事实。
     public let source: String
     /// 宿主记录、服务端校验并冻结的首次登录真实发生时间。
     public let occurredAt: String
@@ -497,15 +576,16 @@ public struct LoginConfirmation: Codable, Equatable, Sendable {
         source = try container.decode(String.self, forKey: .source)
         occurredAt = try container.decode(String.self, forKey: .occurredAt)
         reportedAt = try container.decode(String.self, forKey: .reportedAt)
-        guard UUID(uuidString: confirmationId) != nil,
+        guard decoder.userInfo[.allowsLegacyAttributionCache] as? Bool == true,
+              UUID(uuidString: confirmationId) != nil,
               status == "RECORDED",
-              source == "SDK_REPORTED",
+              source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
               Self.isValidInstant(occurredAt),
               Self.isValidInstant(reportedAt) else {
             throw DecodingError.dataCorruptedError(
                 forKey: .status,
                 in: container,
-                debugDescription: "login confirmation is outside the public wire contract"
+                debugDescription: "mobile login confirmation is retired and may only be decoded while migrating legacy cache"
             )
         }
     }
@@ -529,6 +609,14 @@ public struct LoginConfirmation: Codable, Equatable, Sendable {
     }
 }
 
+/// CSS px、Android dp 与 iOS point 共用的固定低熵宽度分桶。
+public enum ScreenBucket: String, Codable, Equatable, Sendable {
+    case compact = "COMPACT"
+    case medium = "MEDIUM"
+    case expanded = "EXPANDED"
+    case large = "LARGE"
+}
+
 /// 可选的粗粒度辅助信号。不得扩展为广告标识、稳定设备指纹或精确硬件特征。
 public struct ClientSignals: Codable, Equatable, Sendable {
     public let countryCode: String?
@@ -536,9 +624,10 @@ public struct ClientSignals: Codable, Equatable, Sendable {
     public let timezoneOffsetMinutes: Int?
     public let osMajor: String?
     public let deviceClass: String?
+    public let screenBucket: ScreenBucket?
 
-    public init(countryCode: String? = nil, locale: String? = nil, timezoneOffsetMinutes: Int? = nil, osMajor: String? = nil, deviceClass: String? = nil) {
-        self.countryCode = countryCode; self.locale = locale; self.timezoneOffsetMinutes = timezoneOffsetMinutes; self.osMajor = osMajor; self.deviceClass = deviceClass
+    public init(countryCode: String? = nil, locale: String? = nil, timezoneOffsetMinutes: Int? = nil, osMajor: String? = nil, deviceClass: String? = nil, screenBucket: ScreenBucket? = nil) {
+        self.countryCode = countryCode; self.locale = locale; self.timezoneOffsetMinutes = timezoneOffsetMinutes; self.osMajor = osMajor; self.deviceClass = deviceClass; self.screenBucket = screenBucket
     }
 }
 
@@ -573,7 +662,7 @@ public enum AttributionRecoveryPhase: String, Equatable, Sendable {
     case notDue = "NOT_DUE"
     /// 安装已经登记，等待宿主产生真实登录成功事实。
     case waitingForLogin = "WAITING_FOR_LOGIN"
-    /// 登录事实已经登记或确认，平台尚未返回不可变 FINAL。
+    /// 本地账号已原子绑定，平台尚未返回由 Server Key 事实解锁的不可变 FINAL。
     case waitingForFinal = "WAITING_FOR_FINAL"
     /// 已得到并持久化不可变 FINAL；可消费结果的 `result` 为空，只能通过 `pendingFinalDelivery(accountScope:)` 读取业务待办。
     case final = "FINAL"

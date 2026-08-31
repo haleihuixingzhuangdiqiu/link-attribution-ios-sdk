@@ -44,11 +44,6 @@ public final class LinkAttribution: @unchecked Sendable {
         let retryAfterMs: Int?
     }
 
-    /// 本地已冻结登录事实但确认响应尚未落盘；先幂等重放登录，不能把服务端已冻结 FINAL 当成未登录违例。
-    private struct PendingLoginConfirmationDecision: Error {
-        let retryAfterMs: Int?
-    }
-
     /** 只保存服务端允许的第一方引用，不保存原始剪贴板文本、完整 URL 或来源 App。 */
     private struct PendingUserProvidedEvidence: Codable, Equatable {
         let eventId: String
@@ -77,14 +72,15 @@ public final class LinkAttribution: @unchecked Sendable {
         var loginEventId: String?
         /// 宿主真实登录成功的发生时间；与 loginEventId 一起冻结。
         var loginOccurredAt: String?
-        /// 登录请求首次真正开始发送的本地时间；只有该事实存在，响应丢失后的服务端 FINAL 才可暂缓恢复。
+        /// 仅为 v3 旧缓存迁移保留；v4 必须为 nil。
         var loginSubmissionAttemptedAt: String?
+        /// 仅为 v3 旧缓存迁移保留；v4 必须为 nil，不能解锁 FINAL。
         var loginConfirmation: LoginConfirmation?
-        /// 登录确认响应丢失时先隔离服务端不可变 FINAL；确认恢复后只允许完全相同结果进入业务 outbox。
+        /// 仅为 v3 旧缓存迁移保留；v4 必须为 nil，迁移时不会进入业务 outbox。
         var pendingLoginFinal: AttributionResult?
-        /// 当前登录事实已被平台永久拒绝；保留事实用于阻止冷启动重复上报，下一次真实登录可创建新事件。
+        /// 仅为 v3 旧缓存迁移保留；v4 必须为 false。
         var loginConfirmationPermanentlyRejected: Bool
-        /// 登录永久拒绝所属的 SDK 凭据摘要；Key 轮换后可幂等重放同一登录事实。
+        /// 仅为 v3 旧缓存迁移保留；v4 必须为 nil。
         var loginRejectionCredentialScope: String?
         var pendingUserProvidedEvidence: PendingUserProvidedEvidence?
         /// 已接受的最高追加式决策序号；网络重试不得让迟到旧响应覆盖新结果。
@@ -253,13 +249,6 @@ public final class LinkAttribution: @unchecked Sendable {
         let failureReason: NavigationFailureReason?
         let durationMs: Int?
     }
-    /// 登录确认只关联本安装与本次幂等写入；发生时间持久不变，本次上报时间逐次刷新。
-    private struct LoginCompletedRequest: Encodable {
-        let installationEventId: String
-        let eventId: String
-        let occurredAt: String
-        let reportedAt: String
-    }
     private struct UserProvidedEvidencePayload: Encodable {
         let source = "IOS_USER_PASTE"
         let linkToken: String?
@@ -289,7 +278,7 @@ public final class LinkAttribution: @unchecked Sendable {
     /// 同一持久作用域的多个 SDK 实例共享状态锁、网络门禁和恢复任务，避免跨实例覆盖账号或 FINAL。
     private let synchronization: SDKScopeSynchronization
     private var lock: NSLock { synchronization.stateLock }
-    /// 归因 GET/POST 与会改写决策版本的证据、登录请求必须串行，避免迟到旧响应重新写回旧 FINAL。
+    /// 归因 GET/POST 与会改写决策版本的证据请求必须串行，避免迟到旧响应重新写回旧 FINAL。
     private var stateNetworkGate: AsyncOperationGate { synchronization.networkGate }
     /// 与 Android 公共 SDK 对齐的轮询安全边界，避免 0 忙轮询、负数转换崩溃或超长休眠。
     private static let minimumPollInterval: TimeInterval = 0.25
@@ -305,7 +294,7 @@ public final class LinkAttribution: @unchecked Sendable {
     private static let maximumJSONCollectionItems = 10_000
     /// 历史 token GET 端点仍受常见代理请求行上限约束；新项目应优先使用正文承载参数的接口。
     private static let maximumLegacyResolvePathBytes = 8 * 1_024
-    private static let currentStorageVersion = 3
+    private static let currentStorageVersion = 4
 
     /// 校验并冻结安全边界，迁移旧缓存键；任何无效配置都在发起网络请求前失败。
     public init(configuration: LinkAttributionConfiguration, integrityProvider: any IntegrityTokenProvider = NoIntegrityTokenProvider(), session: URLSession? = nil, userDefaults: UserDefaults = .standard) throws {
@@ -356,11 +345,12 @@ public final class LinkAttribution: @unchecked Sendable {
         if let session { self.session = session }
         else { let config = URLSessionConfiguration.ephemeral; config.timeoutIntervalForRequest = configuration.timeout; self.session = URLSession(configuration: config) }
         self.defaults = userDefaults
-        let stableStorageKey = "\(configuration.storageNamespace).\(Self.stableScope(cacheIdentity)).installation.v3"
+        let stableStorageKey = "\(configuration.storageNamespace).\(Self.stableScope(cacheIdentity)).installation.v4"
         self.storageKey = stableStorageKey
         self.credentialScope = Self.stableScope("credential|\(configuration.sdkKey)")
         self.synchronization = SDKScopeSynchronizationRegistry.shared.synchronization(for: stableStorageKey)
         let legacyStorageKeys = [
+            "\(configuration.storageNamespace).\(Self.stableScope(cacheIdentity)).installation.v3",
             "\(configuration.storageNamespace).\(Self.stableScope("\(configuration.apiBaseURL.absoluteString)|\(configuration.cacheScope)")).installation.v2",
             "\(configuration.storageNamespace).\(Self.stableScope(cacheIdentity)).installation.v2",
             "\(configuration.storageNamespace).\(Self.stableScope("\(configuration.apiBaseURL.absoluteString)|\(configuration.sdkKey)")).installation.v1",
@@ -498,8 +488,8 @@ public final class LinkAttribution: @unchecked Sendable {
                 try await resolveInstallationOnce(signals: signals)
             }
             return try publicDiagnosticResult(result)
-        } catch is DeferredAttributionDecision, is PendingLoginConfirmationDecision {
-            // 公开错误保持稳定且可重试；不泄露登录或决策高水位等本地门槛。
+        } catch is DeferredAttributionDecision {
+            // 公开错误保持稳定且可重试；不泄露决策高水位等本地门槛。
             throw LinkAttributionError.timeout
         }
     }
@@ -532,18 +522,9 @@ public final class LinkAttribution: @unchecked Sendable {
             do {
                 try validateAttribution(terminal, for: state, expectedAttributionId: state.attributionId)
                 return terminal
-            } catch let pendingLogin as PendingLoginConfirmationDecision {
-                // 兼容旧版本误缓存：已有登录事实时先移除可消费结果，等待同一登录幂等确认后再回源。
-                try mutateExistingState(expectedEventId: state.eventId) { current in
-                    current.terminalResult = nil
-                    current.lastDecisionSequence = nil
-                    current.invalidatedThroughDecisionSequence = nil
-                    current.pendingLoginFinal = terminal
-                }
-                throw pendingLogin
             } catch {
-                // 旧缓存或登录门槛不再合法时保留事件与发生时间，只清结果并回源同一 attribution。
-                let rejectedPreLoginFinal = terminal.isConsumableFinal && state.loginConfirmation == nil
+                // 旧缓存或本地账号门槛不再合法时保留事件与发生时间，只清结果并回源同一 attribution。
+                let rejectedPreLoginFinal = terminal.isConsumableFinal && Self.hasTrustedAccountBinding(state) == false
                 try mutateExistingState(expectedEventId: state.eventId) { current in
                     current.terminalResult = nil
                     current.lastDecisionSequence = Self.maximumSequence(current.lastDecisionSequence, terminal.decisionSequence)
@@ -562,8 +543,8 @@ public final class LinkAttribution: @unchecked Sendable {
         if let attributionId = state.attributionId {
             do {
                 return try await getAttributionOnce(attributionId: attributionId)
-            } catch is DeferredAttributionDecision, is PendingLoginConfirmationDecision {
-                // 登录或主动证据已经使旧决策失效；等待服务端追加更高序号，而不是永久停止恢复。
+            } catch is DeferredAttributionDecision {
+                // 主动证据已经使旧决策失效；等待服务端追加更高序号，而不是永久停止恢复。
                 throw LinkAttributionError.timeout
             }
         }
@@ -593,19 +574,19 @@ public final class LinkAttribution: @unchecked Sendable {
             idempotencyKey: state.eventId,
             appVersion: frozenAppVersion
         )
+        guard let responseState = try loadStateStrict(), responseState.eventId == state.eventId else {
+            // 登录回调可在安装请求期间原子绑定账号；校验必须合并最新同代次状态，而不能使用触网前旧快照。
+            throw CancellationError()
+        }
         do {
-            try validateAttribution(result, for: state)
-        } catch let pendingLogin as PendingLoginConfirmationDecision {
-            // 登录 POST 可能已被服务端受理但响应丢失；只保存归因 ID，不能缓存 FINAL 或推进序号。
-            try quarantinePendingLoginFinal(result, expectedEventId: state.eventId)
-            throw pendingLogin
+            try validateAttribution(result, for: responseState)
         } catch {
-            // 合法 wire 即使越过本地登录门槛，也先保留 attributionId，登录确认仍可继续同一安装。
-            let rejectedPreLoginFinal = result.isConsumableFinal && state.loginConfirmation == nil
+            // 合法 wire 即使越过本地账号门槛，也先保留 attributionId，宿主仍可诊断同一安装。
+            let rejectedPreLoginFinal = result.isConsumableFinal && Self.hasTrustedAccountBinding(responseState) == false
             try mutateExistingState(expectedEventId: state.eventId) { current in
                 current.attributionId = result.attributionId
                 current.lastDecisionSequence = Self.maximumSequence(current.lastDecisionSequence, result.decisionSequence)
-                if state.preLoginConsumableFinalRejected || rejectedPreLoginFinal {
+                if responseState.preLoginConsumableFinalRejected || rejectedPreLoginFinal {
                     current.preLoginConsumableFinalRejected = true
                     current.nextRecoveryAt = nil
                     current.recoveryPermanentlyStopped = true
@@ -620,7 +601,6 @@ public final class LinkAttribution: @unchecked Sendable {
             current.lastDecisionSequence = Self.maximumSequence(current.lastDecisionSequence, result.decisionSequence)
             if result.isFinal {
                 current.terminalResult = result
-                current.pendingLoginFinal = nil
             }
         }) != nil else { throw CancellationError() }
         return result
@@ -683,7 +663,7 @@ public final class LinkAttribution: @unchecked Sendable {
                 try await getAttributionOnce(attributionId: attributionId)
             }
             return try publicDiagnosticResult(result)
-        } catch is DeferredAttributionDecision, is PendingLoginConfirmationDecision {
+        } catch is DeferredAttributionDecision {
             // 公开错误保持稳定且可重试；不把内部决策高水位暴露给宿主。
             throw LinkAttributionError.timeout
         }
@@ -714,10 +694,6 @@ public final class LinkAttribution: @unchecked Sendable {
         }
         do {
             try validateAttribution(result, for: currentState, expectedAttributionId: attributionId)
-        } catch let pendingLogin as PendingLoginConfirmationDecision {
-            // 登录事实已存在但确认响应未落盘时，同一 FINAL 只是待确认结果；不得缓存或推进任何序号。
-            try quarantinePendingLoginFinal(result, expectedEventId: currentState.eventId)
-            throw pendingLogin
         } catch let deferred as DeferredAttributionDecision {
             // 门槛未满足时只推进本地序号高水位，不缓存或返回含 share code 的结果。
             try mutateExistingState(expectedEventId: currentState.eventId) { state in
@@ -728,14 +704,11 @@ public final class LinkAttribution: @unchecked Sendable {
         } catch {
             if result.attributionId == attributionId,
                currentState.terminalResult?.isFinal != true {
-                let rejectedPreLoginFinal = result.isConsumableFinal && currentState.loginConfirmation == nil
-                let changedQuarantinedFinal = currentState.pendingLoginFinal.map {
-                    result.isFinal && Self.sameFrozenAttribution($0, result) == false
-                } ?? false
+                let rejectedPreLoginFinal = result.isConsumableFinal && Self.hasTrustedAccountBinding(currentState) == false
                 try mutateExistingState(expectedEventId: currentState.eventId) { state in
                     guard state.attributionId == attributionId else { return }
                     state.lastDecisionSequence = Self.maximumSequence(state.lastDecisionSequence, result.decisionSequence)
-                    if currentState.preLoginConsumableFinalRejected || rejectedPreLoginFinal || changedQuarantinedFinal {
+                    if currentState.preLoginConsumableFinalRejected || rejectedPreLoginFinal {
                         state.preLoginConsumableFinalRejected = true
                         state.nextRecoveryAt = nil
                         state.recoveryPermanentlyStopped = true
@@ -752,7 +725,6 @@ public final class LinkAttribution: @unchecked Sendable {
             state.lastDecisionSequence = Self.maximumSequence(state.lastDecisionSequence, result.decisionSequence)
             if result.isFinal {
                 state.terminalResult = result
-                state.pendingLoginFinal = nil
                 state.recoveryAttempt = 0
                 state.nextRecoveryAt = nil
             }
@@ -781,10 +753,6 @@ public final class LinkAttribution: @unchecked Sendable {
                 }
                 if result.isFinal { return try publicDiagnosticResult(result) }
                 retryAfterMs = result.retryAfterMs
-            } catch let pendingLogin as PendingLoginConfirmationDecision {
-                // 旧查询入口不能替代登录幂等恢复；立即返回可重试超时，让统一恢复先补登录确认。
-                _ = pendingLogin.retryAfterMs
-                throw LinkAttributionError.timeout
             } catch let deferred as DeferredAttributionDecision {
                 // 迟到旧序号不是永久协议错误；保持原 attributionId 并继续等待服务端追加更高决策。
                 retryAfterMs = deferred.retryAfterMs
@@ -814,10 +782,10 @@ public final class LinkAttribution: @unchecked Sendable {
         do {
             var pending: PendingUserProvidedEvidence!
             let installationState = try mutateState { state in
-                // 平台 FINAL 不可变；必须在写待办的同一临界区重查，不能让并发终态后重新打开证据。
-                guard state.terminalResult?.isFinal != true,
-                      state.pendingLoginFinal == nil,
-                      state.preLoginConsumableFinalRejected == false else {
+                // FINAL 后只允许已经由宿主真实登录回调建立本地绑定的显式证据。平台仍会独立校验
+                // Server Key 登录链，并把证据送入 reconciliation；SDK 不重开原 FINAL 或业务 outbox。
+                guard state.preLoginConsumableFinalRejected == false,
+                      state.terminalResult?.isFinal != true || Self.hasTrustedAccountBinding(state) else {
                     throw LinkAttributionError.invalidResponse
                 }
                 if let existing = state.pendingUserProvidedEvidence {
@@ -853,7 +821,7 @@ public final class LinkAttribution: @unchecked Sendable {
     public func retryPendingUserProvidedEvidence() async -> IOSUserProvidedEvidenceSubmission? {
         guard configuration.userProvidedEvidenceEnabled else { return .disabled }
         guard let state = loadState() else { return nil }
-        if state.terminalResult?.isFinal == true || state.pendingLoginFinal != nil || state.preLoginConsumableFinalRejected {
+        if state.preLoginConsumableFinalRejected || state.terminalResult?.isFinal == true && Self.hasTrustedAccountBinding(state) == false {
             _ = try? mutateExistingState(expectedEventId: state.eventId) { $0.pendingUserProvidedEvidence = nil }
             return .rejected
         }
@@ -866,7 +834,7 @@ public final class LinkAttribution: @unchecked Sendable {
         try ensureCurrentInstallation(expectedEventId)
         guard configuration.userProvidedEvidenceEnabled else { return .disabled }
         guard let state = loadState(), state.eventId == expectedEventId else { throw CancellationError() }
-        if state.terminalResult?.isFinal == true || state.preLoginConsumableFinalRejected {
+        if state.preLoginConsumableFinalRejected || state.terminalResult?.isFinal == true && Self.hasTrustedAccountBinding(state) == false {
             _ = try? mutateExistingState(expectedEventId: expectedEventId) { $0.pendingUserProvidedEvidence = nil }
             return .rejected
         }
@@ -884,9 +852,8 @@ public final class LinkAttribution: @unchecked Sendable {
             guard let invocationState = loadState(),
                   expectedEventId == nil || invocationState.eventId == expectedEventId else { return .deferred }
             let invocationEventId = invocationState.eventId
-            if invocationState.terminalResult?.isFinal == true
-                || invocationState.pendingLoginFinal != nil
-                || invocationState.preLoginConsumableFinalRejected {
+            if invocationState.preLoginConsumableFinalRejected
+                || invocationState.terminalResult?.isFinal == true && Self.hasTrustedAccountBinding(invocationState) == false {
                 _ = try? mutateExistingState(expectedEventId: invocationEventId) { state in
                     guard state.pendingUserProvidedEvidence?.eventId == pending.eventId else { return }
                     state.pendingUserProvidedEvidence = nil
@@ -897,9 +864,8 @@ public final class LinkAttribution: @unchecked Sendable {
                 try ensureCurrentInstallation(invocationEventId)
                 guard let currentState = loadState(),
                       currentState.eventId == invocationEventId,
-                      currentState.terminalResult?.isFinal != true,
-                      currentState.pendingLoginFinal == nil,
-                      currentState.preLoginConsumableFinalRejected == false else {
+                      currentState.preLoginConsumableFinalRejected == false,
+                      currentState.terminalResult?.isFinal != true || Self.hasTrustedAccountBinding(currentState) else {
                     return .rejected
                 }
                 if currentState.attributionId == nil {
@@ -924,8 +890,8 @@ public final class LinkAttribution: @unchecked Sendable {
     /**
      在已经持有决策网络锁时冲刷一条用户主动证据。
 
-     登录确认必须复用本入口，让离线队列中的主动证据先于登录到达平台；否则登录门槛可能先冻结 FINAL，
-     导致真实且已落盘的第一方 share code 被迟到拒绝。临时失败保留原事件，永久失败只清本条待办。
+     恢复编排复用本入口，让离线队列中的主动证据先于后续归因查询到达平台。临时失败保留原事件，
+     永久失败只清本条待办；移动端账号绑定不会产生网络登录事件。
      */
     private func sendUserProvidedEvidenceWhileHoldingNetworkGate(
         _ pending: PendingUserProvidedEvidence,
@@ -937,7 +903,8 @@ public final class LinkAttribution: @unchecked Sendable {
                   state.attributionId != nil else { return .deferred }
             // 同一 pending 的并发调用在首个请求成功后直接复用“已受理”事实，不重复触网。
             guard state.pendingUserProvidedEvidence?.eventId == pending.eventId else { return .accepted }
-            if state.terminalResult?.isFinal == true || state.pendingLoginFinal != nil || state.preLoginConsumableFinalRejected {
+            if state.preLoginConsumableFinalRejected
+                || state.terminalResult?.isFinal == true && Self.hasTrustedAccountBinding(state) == false {
                 try discardPendingUserProvidedEvidence(pending, installationEventId: state.eventId)
                 return .rejected
             }
@@ -964,12 +931,36 @@ public final class LinkAttribution: @unchecked Sendable {
                 guard response.attributionId == state.attributionId else {
                     throw LinkAttributionError.invalidResponse
                 }
-                // 另一个 SDK 实例可能在证据请求期间已经冻结 FINAL；迟到响应只能清理本条待办，绝不能重开。
-                if current.terminalResult?.isFinal == true || current.preLoginConsumableFinalRejected {
+                if current.preLoginConsumableFinalRejected {
                     if current.pendingUserProvidedEvidence?.eventId == pending.eventId {
                         current.pendingUserProvidedEvidence = nil
                     }
                     disposition = .rejected
+                    return
+                }
+                if let frozen = current.terminalResult, frozen.isFinal {
+                    // FINAL 后 POST 是独立 reconciliation receipt。响应可仍是原 current，或在 Worker
+                    // 已提交时成为更高序号的新 current；两者都不得覆盖本地原 FINAL、重新打开 outbox
+                    // 或触发二次权益。相同序号换 decisionId、倒退和非 FINAL 响应继续 fail-closed。
+                    let sameCurrent = response.decisionSequence == frozen.decisionSequence
+                        && Self.sameFrozenAttribution(frozen, response)
+                    let newerCurrent = response.isFinal
+                        && response.decisionSequence > frozen.decisionSequence
+                        && response.decisionId != frozen.decisionId
+                    guard Self.hasTrustedAccountBinding(current), sameCurrent || newerCurrent else {
+                        if current.pendingUserProvidedEvidence?.eventId == pending.eventId {
+                            current.pendingUserProvidedEvidence = nil
+                        }
+                        disposition = .rejected
+                        return
+                    }
+                    current.lastDecisionSequence = Self.maximumSequence(
+                        current.lastDecisionSequence,
+                        response.decisionSequence
+                    )
+                    if current.pendingUserProvidedEvidence?.eventId == pending.eventId {
+                        current.pendingUserProvidedEvidence = nil
+                    }
                     return
                 }
                 current.attributionId = response.attributionId
@@ -984,36 +975,16 @@ public final class LinkAttribution: @unchecked Sendable {
                         current.recoveryPermanentlyStopped = true
                         current.nextRecoveryAt = nil
                         disposition = .rejected
-                    } else if response.isConsumableFinal, current.loginConfirmation == nil {
-                        if current.loginEventId != nil,
-                           current.loginOccurredAt != nil,
-                           current.loginSubmissionAttemptedAt != nil {
-                            // 登录可能已在服务端成功但确认响应丢失；不缓存/不推进 FINAL，先幂等恢复登录。
-                            current.invalidatedThroughDecisionSequence = Self.maximumSequence(
-                                current.invalidatedThroughDecisionSequence,
-                                current.lastDecisionSequence
-                            )
-                            if let quarantined = current.pendingLoginFinal,
-                               Self.sameFrozenAttribution(quarantined, response) == false {
-                                current.preLoginConsumableFinalRejected = true
-                                current.recoveryPermanentlyStopped = true
-                                current.nextRecoveryAt = nil
-                                disposition = .rejected
-                            } else {
-                                current.pendingLoginFinal = response
-                            }
-                        } else {
-                            // 从未有本地登录事实却收到业务 FINAL 属于不可重开的服务端契约违例。
-                            current.preLoginConsumableFinalRejected = true
-                            current.recoveryPermanentlyStopped = true
-                            current.nextRecoveryAt = nil
-                            current.pendingUserProvidedEvidence = nil
-                            disposition = .rejected
-                        }
+                    } else if response.isConsumableFinal, Self.hasTrustedAccountBinding(current) == false {
+                        // Server Key 确认可以先于本机回调完成，但本地未原子绑定账号时绝不形成业务交付。
+                        current.preLoginConsumableFinalRejected = true
+                        current.recoveryPermanentlyStopped = true
+                        current.nextRecoveryAt = nil
+                        current.pendingUserProvidedEvidence = nil
+                        disposition = .rejected
                     } else {
                         // 登录后业务 FINAL 或无匹配诊断 FINAL 都直接冻结；业务候选仍只从账号 outbox 读取。
                         current.terminalResult = response
-                        current.pendingLoginFinal = nil
                         current.lastDecisionSequence = Self.maximumSequence(
                             current.lastDecisionSequence,
                             response.decisionSequence
@@ -1050,102 +1021,64 @@ public final class LinkAttribution: @unchecked Sendable {
         }
     }
 
-    /**
-     在宿主真实登录成功且业务会话已落库后登记首次登录。
-
-     SDK 只复用当前安装的随机 `eventId`，不读取或上传账号、Token、用户 ID 或设备稳定标识。
-     登录事件 ID 在发送前持久化；失败后可由 `retryPendingLoginConfirmation()` 复用同一幂等键重试。
-     */
+    /// 移动端登录上报已停用；业务后端必须使用 Server Key 确认登录，SDK 只做本地账号绑定并轮询归因。
+    @available(*, deprecated, message: "移动端登录上报已停用；请使用 recordAuthenticatedLogin(accountScope:)，并由业务后端使用 Server Key 确认登录")
     public func trackLoginCompleted() async throws -> LoginConfirmation {
-        let expectedEventId = try ensureLoginCompletedOccurrence().eventId
-        return try await trackExistingLoginCompleted(expectedEventId: expectedEventId)
+        throw LinkAttributionError.invalidArgument("mobile login confirmation is retired; use local account binding and Server Key confirmation")
     }
 
-    /// 只发送指定安装代次中已经冻结的登录事实，并统一处理永久失败；恢复入口不得经由会创建事实的公开 API。
-    private func trackExistingLoginCompleted(expectedEventId: String) async throws -> LoginConfirmation {
-        do {
-            return try await trackLoginCompletedOnce(expectedEventId: expectedEventId)
-        } catch let error as LinkAttributionError {
-            if error.isRetryable == false {
-                _ = try? mutateExistingState(expectedEventId: expectedEventId) { state in
-                    guard state.loginConfirmation == nil, state.loginEventId != nil else { return }
-                    if let pending = state.pendingLoginFinal,
-                       let deliveryId = Self.deliveryId(for: pending) {
-                        state.suppressedUnboundDeliveryId = deliveryId
-                    }
-                    state.pendingLoginFinal = nil
-                    state.loginConfirmationPermanentlyRejected = true
-                    state.loginRejectionCredentialScope = credentialScope
-                    state.nextRecoveryAt = nil
-                    state.recoveryPermanentlyStopped = true
-                    state.recoveryCredentialScope = credentialScope
-                }
-            }
-            throw error
-        }
-    }
-
-    /// 仅重试先前已由真实登录成功信号创建的待发送事实；无待办时返回 `nil`。
+    /// 移动端不再维护登录网络待办；为源码兼容固定返回 `nil` 且不触网、不改写状态。
+    @available(*, deprecated, message: "移动端登录上报已停用；服务端确认由业务后端使用 Server Key 完成")
     public func retryPendingLoginConfirmation() async throws -> LoginConfirmation? {
-        guard let state = try loadStateStrict() else { return nil }
-        // 已确认不再属于“待重试”；避免宿主每次冷启动都误判为刚恢复并重复刷新 FINAL。
-        if state.loginConfirmation != nil { return nil }
-        if state.loginConfirmationPermanentlyRejected { return nil }
-        guard state.loginEventId != nil else { return nil }
-        return try await trackExistingLoginCompleted(expectedEventId: state.eventId)
-    }
-
-    /// 恢复编排专用入口；直接复用已冻结登录事实，不通过兼容入口为新安装创建事实。
-    private func retryPendingLoginConfirmation(expectedEventId: String) async throws -> LoginConfirmation? {
-        guard let state = loadState(), state.eventId == expectedEventId else { throw CancellationError() }
-        if state.loginConfirmation != nil { return nil }
-        if state.loginConfirmationPermanentlyRejected { return nil }
-        guard state.loginEventId != nil else { return nil }
-        return try await trackExistingLoginCompleted(expectedEventId: expectedEventId)
+        nil
     }
 
     /**
      在宿主登录成功回调的同步栈内原子绑定脱敏账号并冻结登录事实。
 
-     本方法不触网、不上传账号作用域；绑定失败时不会留下半条登录事件。宿主随后调用
-     `trackLoginCompleted()` 发送同一持久事实，业务 FINAL 只从 `pendingFinalDelivery(accountScope:)` 读取。
+     本方法不触网、不上传账号作用域；绑定失败时不会留下半条本地事实。业务后端通过 Server Key
+     确认真实登录，SDK 只轮询同一 attribution；业务 FINAL 只从 `pendingFinalDelivery(accountScope:)` 读取。
      */
     public func recordAuthenticatedLogin(accountScope: String) throws {
         let normalized = try validatedAccountScope(accountScope)
         try mutateState { state in
             try bindAuthenticatedAccount(normalized, to: &state)
             recordLoginCompletedOccurrence(in: &state)
+            // v4 以后移动端登录网络确认永久停用；调用时顺带撤销任何历史待办或确认缓存。
+            state.loginSubmissionAttemptedAt = nil
+            state.loginConfirmation = nil
+            state.pendingLoginFinal = nil
+            state.loginConfirmationPermanentlyRejected = false
+            state.loginRejectionCredentialScope = nil
         }
     }
 
     /**
-     兼容旧宿主的拆分式登录事实入口；新接入应使用 `recordAuthenticatedLogin(accountScope:)`，
-     避免登录事实与账号绑定之间出现可消费 FINAL 的竞态。
+     拆分式入口无法证明账号绑定与登录回调原子完成，现固定拒绝且不改写状态。
      */
     @available(*, deprecated, message: "请使用 recordAuthenticatedLogin(accountScope:) 原子绑定账号并记录登录事实")
     public func recordLoginCompletedOccurrence() throws {
-        _ = try ensureLoginCompletedOccurrence()
+        throw LinkAttributionError.invalidArgument("split login recording is retired; use recordAuthenticatedLogin(accountScope:)")
     }
 
     /// 是否已经由宿主真实登录信号建立本地事实；仅供内部恢复调度，不代表平台已确认或匹配成功。
     public var hasRecordedLoginCompletedFact: Bool {
-        loadState()?.loginEventId != nil
+        loadState().map(Self.hasTrustedAccountBinding) ?? false
     }
 
-    /// 是否仍可显示用户主动补强入口；配置关闭或平台结果已经 FINAL 时为 `false`。
+    /// 是否仍可显示用户主动补强入口；FINAL 后仅对已完成本地可信登录绑定的安装开放独立对账证据。
     public var canSubmitUserProvidedEvidence: Bool {
         guard configuration.userProvidedEvidenceEnabled else { return false }
-        let state = loadState()
-        return state?.terminalResult?.isFinal != true
-            && state?.pendingLoginFinal == nil
-            && state?.preLoginConsumableFinalRejected != true
+        guard let state = loadState() else { return true }
+        guard state.preLoginConsumableFinalRejected == false else { return false }
+        return state.terminalResult?.isFinal != true || Self.hasTrustedAccountBinding(state)
     }
 
     /**
      恢复当前安装尚未完成的归因工作。
 
      宿主只在启动、前台、网络恢复或 SDK 返回的计划时间调用本方法；SDK 内部按“主动证据 →
-     登录事实 → 安装查询 → FINAL 轮询”顺序执行，并持久化指数退避。前台和网络恢复信号可提前
+     安装查询 → FINAL 轮询”顺序执行，并持久化指数退避。前台和网络恢复信号可提前
      唤醒一次，定时触发严格遵守 `nextRetryAt`。所有失败都旁路宿主原业务；只有合法 FINAL 会
      进入本地 outbox，业务仍须调用 `pendingFinalDelivery(accountScope:)` 并在真实处理成功后 ack。
      可消费 FINAL 的 `phase` 为 `.final`，但 `result` 固定为 `nil`，避免恢复入口绕过账号 outbox。
@@ -1197,8 +1130,9 @@ public final class LinkAttribution: @unchecked Sendable {
     ) async throws -> AttributionRecoveryOutcome {
         try ensureCurrentInstallation(expectedEventId)
         let deadline = ProcessInfo.processInfo.systemUptime + pollingTimeout
-        if let terminal = loadState()?.terminalResult, terminal.isFinal,
-           loadState()?.preLoginConsumableFinalRejected != true {
+        if let state = loadState(), let terminal = state.terminalResult, terminal.isFinal,
+           state.preLoginConsumableFinalRejected != true,
+           state.pendingUserProvidedEvidence == nil {
             try clearRecoverySchedule(expectedEventId: expectedEventId)
             return AttributionRecoveryOutcome(
                 phase: .final,
@@ -1210,16 +1144,7 @@ public final class LinkAttribution: @unchecked Sendable {
             // SDK Key 已轮换；旧凭据造成的退避/永久停止不能阻断新凭据自愈。
             try clearRecoverySchedule(expectedEventId: expectedEventId, clearPermanentStop: true)
         }
-        if let state = loadState(), state.loginConfirmationPermanentlyRejected,
-           state.loginRejectionCredentialScope != nil,
-           state.loginRejectionCredentialScope != credentialScope {
-            guard try mutateExistingState(expectedEventId: expectedEventId, { current in
-                current.loginConfirmationPermanentlyRejected = false
-                current.loginRejectionCredentialScope = nil
-                current.recoveryPermanentlyStopped = false
-                current.recoveryCredentialScope = nil
-            }) != nil else { throw CancellationError() }
-        } else if loadState()?.recoveryPermanentlyStopped == true {
+        if loadState()?.recoveryPermanentlyStopped == true {
             return AttributionRecoveryOutcome(phase: .stopped)
         }
         if trigger == .scheduled || trigger == .appLaunch,
@@ -1242,16 +1167,6 @@ public final class LinkAttribution: @unchecked Sendable {
                 )
             }
 
-            if hasRecordedLoginCompletedFact {
-                try ensureCurrentInstallation(expectedEventId)
-                _ = try await retryPendingLoginConfirmation(expectedEventId: expectedEventId)
-                try ensureCurrentInstallation(expectedEventId)
-                if loadState()?.loginConfirmationPermanentlyRejected == true {
-                    try stopAutomaticRecovery(expectedEventId: expectedEventId)
-                    return AttributionRecoveryOutcome(phase: .stopped)
-                }
-            }
-
             let current: AttributionResult
             do {
                 current = try await stateNetworkGate.withLock {
@@ -1260,7 +1175,7 @@ public final class LinkAttribution: @unchecked Sendable {
                 }
                 try ensureCurrentInstallation(expectedEventId)
             } catch LinkAttributionError.timeout
-                where pollingTimeout > 0 && loadState()?.loginConfirmation != nil {
+                where pollingTimeout > 0 && loadState().map(Self.hasTrustedAccountBinding) == true {
                 guard let attributionId = loadState()?.attributionId else { throw LinkAttributionError.timeout }
                 let remaining = deadline - ProcessInfo.processInfo.systemUptime
                 guard remaining > 0 else { throw LinkAttributionError.timeout }
@@ -1335,17 +1250,12 @@ public final class LinkAttribution: @unchecked Sendable {
     }
 
     /**
-     把当前安装的登录事实绑定到宿主本地脱敏账号作用域。
-
-     SDK 不上传该值；首次绑定后禁止换绑，避免同一安装的冻结结果被另一个账号误消费。
-     宿主应传入不可逆、非明文的稳定作用域，而不是邮箱、手机号或业务 Token。
+     拆分式账号绑定已停用；账号作用域与登录回调必须由 `recordAuthenticatedLogin` 原子保存。
      */
     @available(*, deprecated, message: "请使用 recordAuthenticatedLogin(accountScope:) 原子绑定账号并记录登录事实")
     public func bindAuthenticatedAccount(scope: String) throws {
-        let normalized = try validatedAccountScope(scope)
-        try mutateState { state in
-            try bindAuthenticatedAccount(normalized, to: &state)
-        }
+        _ = scope
+        throw LinkAttributionError.invalidArgument("split account binding is retired; use recordAuthenticatedLogin(accountScope:)")
     }
 
     /// 返回当前账号仍待业务确认的 FINAL；无匹配、账号不符或已 ack 时返回 `nil`。
@@ -1353,9 +1263,10 @@ public final class LinkAttribution: @unchecked Sendable {
         let normalized = try validatedAccountScope(accountScope)
         guard let state = try loadStateStrict(), state.deliveryAccountScopeTrusted,
               state.deliveryAccountScope == normalized,
-              state.loginConfirmation != nil,
+              Self.hasTrustedAccountBinding(state),
               state.preLoginConsumableFinalRejected == false,
               let result = state.terminalResult, result.isConsumableFinal,
+              result.decisionId != nil,
               let deliveryId = Self.deliveryId(for: result),
               state.suppressedUnboundDeliveryId != deliveryId,
               state.acknowledgedDeliveryId != deliveryId else {
@@ -1375,9 +1286,10 @@ public final class LinkAttribution: @unchecked Sendable {
         guard try mutateExistingState({ state in
             guard state.deliveryAccountScopeTrusted,
                   state.deliveryAccountScope == normalized,
-                  state.loginConfirmation != nil,
+                  Self.hasTrustedAccountBinding(state),
                   state.preLoginConsumableFinalRejected == false,
                   let result = state.terminalResult,
+                  result.decisionId != nil,
                   Self.deliveryId(for: result) == deliveryId,
                   state.suppressedUnboundDeliveryId != deliveryId else {
                 throw LinkAttributionError.invalidArgument("final delivery does not belong to the current account scope")
@@ -1393,96 +1305,13 @@ public final class LinkAttribution: @unchecked Sendable {
         let normalized = try validatedAccountScope(accountScope)
         guard let state = try loadStateStrict(), state.deliveryAccountScopeTrusted,
               state.deliveryAccountScope == normalized,
-              state.loginConfirmation != nil,
+              Self.hasTrustedAccountBinding(state),
               state.preLoginConsumableFinalRejected == false,
               let result = state.terminalResult,
+              result.decisionId != nil,
               let deliveryId = Self.deliveryId(for: result),
               state.suppressedUnboundDeliveryId != deliveryId else { return false }
         return result.isFinal
-    }
-
-    /// 完成一次可恢复的登录确认；必要时先登记同一安装事件。
-    private func trackLoginCompletedOnce(expectedEventId: String) async throws -> LoginConfirmation {
-        // 登录事实已经由公开入口同步落盘；异步旧代次不得在 clear 后替新安装制造登录事实。
-        let pendingState = try requireState()
-        guard pendingState.eventId == expectedEventId else { throw CancellationError() }
-        if let confirmation = pendingState.loginConfirmation { return confirmation }
-        return try await stateNetworkGate.withLock {
-            try ensureCurrentInstallation(expectedEventId)
-            if loadState()?.attributionId == nil {
-                do {
-                    _ = try await resolveInstallationOnce(signals: nil, expectedEventId: expectedEventId)
-                } catch LinkAttributionError.invalidResponse where loadState()?.attributionId != nil {
-                    // 门槛违例也先保存 attributionId，便于平台记录同一登录事实；业务结果仍永久拒绝。
-                } catch LinkAttributionError.timeout where loadState()?.attributionId != nil {
-                    // 登录响应丢失恢复只保留 attributionId，后续先幂等确认登录。
-                }
-            }
-            guard var registeredState = loadState(), registeredState.eventId == expectedEventId else {
-                throw CancellationError()
-            }
-            guard registeredState.attributionId != nil else {
-                throw LinkAttributionError.invalidArgument("installation must be registered before login confirmation")
-            }
-            if configuration.userProvidedEvidenceEnabled,
-               let pendingEvidence = registeredState.pendingUserProvidedEvidence {
-                let submission = await sendUserProvidedEvidenceWhileHoldingNetworkGate(
-                    pendingEvidence,
-                    expectedEventId: expectedEventId
-                )
-                // 证据入口将取消映射为 deferred；抛错式登录恢复仍须原样传播调用任务的取消。
-                try Task.checkCancellation()
-                // 证据请求期间可能被清理并建立新安装；成功或临时失败都不能让旧登录任务采用新代次。
-                guard let refreshedState = loadState(), refreshedState.eventId == expectedEventId else {
-                    throw CancellationError()
-                }
-                guard submission != .deferred else {
-                    // 宿主业务登录已经完成；这里只延后平台登录事实，保持原 eventId/occurredAt 等待恢复。
-                    throw LinkAttributionError.network("pending_user_evidence")
-                }
-                registeredState = refreshedState
-            }
-            guard let eventId = registeredState.loginEventId,
-                  let occurredAt = registeredState.loginOccurredAt else {
-                throw LinkAttributionError.invalidArgument("installation must be registered before login confirmation")
-            }
-            if let confirmation = registeredState.loginConfirmation { return confirmation }
-            guard try mutateExistingState(expectedEventId: expectedEventId, { current in
-                guard current.loginEventId == eventId else {
-                    throw LinkAttributionError.invalidResponse
-                }
-                if current.loginSubmissionAttemptedAt == nil {
-                    // 在真正触网前持久化发送尝试；仅凭“本地计划登录”不能合法化服务端提前 FINAL。
-                    current.loginSubmissionAttemptedAt = now()
-                }
-            }) != nil else {
-                throw CancellationError()
-            }
-            let confirmation: LoginConfirmation = try await request(
-                path: "/v1/sdk/events/login-completed",
-                method: "POST",
-                body: LoginCompletedRequest(
-                    installationEventId: expectedEventId,
-                    eventId: eventId,
-                    occurredAt: occurredAt,
-                    reportedAt: now()
-                ),
-                idempotencyKey: eventId
-            )
-            guard try mutateExistingState(expectedEventId: expectedEventId, { current in
-                guard current.loginEventId == eventId else { return }
-                current.loginConfirmation = confirmation
-                current.loginConfirmationPermanentlyRejected = false
-                current.loginRejectionCredentialScope = nil
-                // 登录受理前已经见到的决策只属于门槛前快照；后续必须收到更高追加序号才能交付。
-                current.invalidatedThroughDecisionSequence = Self.maximumSequence(
-                    current.invalidatedThroughDecisionSequence,
-                    current.lastDecisionSequence
-                )
-                // 登录只推动尚未冻结的归因继续求值。FINAL 是不可变历史，客户端不会因迟到登录重开它。
-            }) != nil else { throw CancellationError() }
-            return confirmation
-        }
     }
 
     /// 仅删除同一安装代次中的指定证据待办；并发创建的新事件不得被旧任务清除。
@@ -1604,11 +1433,37 @@ public final class LinkAttribution: @unchecked Sendable {
             switch state.storageVersion {
             case Self.currentStorageVersion:
                 break
-            case 1, 2:
-                // 旧版本未冻结首次安装的 appVersion/平台。只有已有 attributionId 时才证明服务端已登记，
-                // 后续只会 GET；尚未获得 attributionId 的旧状态可能经历过“服务端成功、响应丢失”，不能用新版本猜测重放。
-                guard state.attributionId != nil else {
-                    throw LinkAttributionError.storage("legacy_install_identity_unavailable")
+            case 1, 2, 3:
+                let legacyVersion = state.storageVersion
+                if legacyVersion < 3 {
+                    // v1/v2 未冻结首次安装的 appVersion/平台。只有已有 attributionId 时才证明服务端已登记，
+                    // 后续只会 GET；尚未获得 attributionId 的旧状态可能经历过响应丢失，不能猜测重放。
+                    guard state.attributionId != nil else {
+                        throw LinkAttributionError.storage("legacy_install_identity_unavailable")
+                    }
+                }
+                // v3 及更早版本曾把移动端登录响应当作可信门槛。迁移时撤销该能力：历史确认、待解封
+                // FINAL 和永久拒绝都不再参与恢复；已缓存的业务 FINAL 则永久标记为不可再次交付。
+                if let terminal = state.terminalResult, terminal.isConsumableFinal {
+                    state.suppressedUnboundDeliveryId = Self.deliveryId(for: terminal)
+                    if terminal.decisionId == nil {
+                        state.terminalResult = nil
+                    }
+                }
+                state.pendingLoginFinal = nil
+                state.loginConfirmation = nil
+                state.loginSubmissionAttemptedAt = nil
+                if state.loginConfirmationPermanentlyRejected {
+                    state.recoveryAttempt = 0
+                    state.nextRecoveryAt = nil
+                    state.recoveryPermanentlyStopped = false
+                    state.recoveryCredentialScope = nil
+                }
+                state.loginConfirmationPermanentlyRejected = false
+                state.loginRejectionCredentialScope = nil
+                if state.loginEventId == nil || state.loginOccurredAt == nil {
+                    state.loginEventId = nil
+                    state.loginOccurredAt = nil
                 }
                 state.storageVersion = Self.currentStorageVersion
                 state.scopeIdentity = cacheIdentity
@@ -1628,6 +1483,15 @@ public final class LinkAttribution: @unchecked Sendable {
                   Self.isNumericAppVersion(appVersion),
                   state.deterministicClickTokenAbsent == true,
                   state.attributionId.map(Self.isValidUUID) ?? true,
+                  state.loginEventId.map(Self.isValidUUID) ?? true,
+                  state.loginOccurredAt.map({ Self.date(from: $0) != nil }) ?? true,
+                  (state.loginEventId == nil) == (state.loginOccurredAt == nil),
+                  state.loginSubmissionAttemptedAt == nil,
+                  state.loginConfirmation == nil,
+                  state.pendingLoginFinal == nil,
+                  state.loginConfirmationPermanentlyRejected == false,
+                  state.loginRejectionCredentialScope == nil,
+                  state.terminalResult?.isConsumableFinal != true || state.terminalResult?.decisionId != nil,
                   state.recoveryAttempt >= 0,
                   state.deliveryAccountScopeTrusted == false || state.deliveryAccountScope != nil
             else {
@@ -1687,12 +1551,6 @@ public final class LinkAttribution: @unchecked Sendable {
             }
         }
     }
-    /// 读取必须存在的安装状态；同步登录事实入口已经负责先建立并持久化。
-    private func requireState() throws -> InstallationState {
-        guard let state = try loadStateStrict() else { throw LinkAttributionError.storage("unavailable") }
-        return state
-    }
-
     /// 异步代次检查：clear/recreate 后旧任务按取消收尾，不把迟到结果记成新安装失败。
     private func ensureCurrentInstallation(_ expectedEventId: String) throws {
         guard try loadStateStrict()?.eventId == expectedEventId else { throw CancellationError() }
@@ -1717,38 +1575,10 @@ public final class LinkAttribution: @unchecked Sendable {
         }
     }
 
-    /// 兼容异步旧入口的本地登录事实自愈；新宿主应先调用原子 `recordAuthenticatedLogin(accountScope:)`。
-    private func ensureLoginCompletedOccurrence() throws -> InstallationState {
-        try mutateState { state in
-            recordLoginCompletedOccurrence(in: &state)
-        }
-    }
-
-    /// 只在同一 `mutateState` 临界区内改写登录事实，供原子账号绑定与兼容入口复用。
+    /// 只在 `recordAuthenticatedLogin` 的同一状态临界区内改写本地登录回调事实。
     private func recordLoginCompletedOccurrence(in state: inout InstallationState) {
-        if state.loginConfirmationPermanentlyRejected {
-            // 只有宿主新的真实登录成功信号会进入本同步入口；为新会话创建新事实并解除旧登录上报失败。
-            if let pending = state.pendingLoginFinal,
-               let deliveryId = Self.deliveryId(for: pending) {
-                state.suppressedUnboundDeliveryId = deliveryId
-            }
-            state.pendingLoginFinal = nil
-            state.loginEventId = UUID().uuidString.lowercased()
-            state.loginOccurredAt = now()
-            state.loginSubmissionAttemptedAt = nil
-            state.loginConfirmation = nil
-            state.loginConfirmationPermanentlyRejected = false
-            state.loginRejectionCredentialScope = nil
-            state.recoveryAttempt = 0
-            state.nextRecoveryAt = nil
-            if state.preLoginConsumableFinalRejected == false {
-                state.recoveryPermanentlyStopped = false
-            }
-            return
-        }
         if state.loginEventId == nil {
             state.loginEventId = UUID().uuidString.lowercased()
-            state.loginSubmissionAttemptedAt = nil
             state.recoveryAttempt = 0
             state.nextRecoveryAt = nil
             if state.preLoginConsumableFinalRejected == false {
@@ -1758,6 +1588,7 @@ public final class LinkAttribution: @unchecked Sendable {
         if state.loginOccurredAt == nil {
             state.loginOccurredAt = now()
         }
+        state.loginSubmissionAttemptedAt = nil
     }
 
     /// 在本地绑定脱敏账号；绑定前已经形成的业务 FINAL 永久抑制，禁止任意后来账号认领。
@@ -1772,41 +1603,16 @@ public final class LinkAttribution: @unchecked Sendable {
            result.isConsumableFinal {
             state.suppressedUnboundDeliveryId = Self.deliveryId(for: result)
         }
-        if state.deliveryAccountScopeTrusted == false,
-           let pending = state.pendingLoginFinal,
-           pending.isConsumableFinal {
-            // 旧拆分 API 在账号绑定前看到的 FINAL 不能被任意后来账号认领。
-            state.suppressedUnboundDeliveryId = Self.deliveryId(for: pending)
-        }
         state.deliveryAccountScope = normalized
         state.deliveryAccountScopeTrusted = true
     }
 
-    /// 隔离“登录请求已发送但确认响应丢失”期间看到的不可变 FINAL；不同结果视为终态重开并永久停止。
-    private func quarantinePendingLoginFinal(_ result: AttributionResult, expectedEventId: String) throws {
-        var contractViolation = false
-        guard try mutateExistingState(expectedEventId: expectedEventId, { state in
-            guard state.attributionId == nil || state.attributionId == result.attributionId else {
-                contractViolation = true
-                state.preLoginConsumableFinalRejected = true
-                state.recoveryPermanentlyStopped = true
-                state.nextRecoveryAt = nil
-                return
-            }
-            state.attributionId = result.attributionId
-            if let quarantined = state.pendingLoginFinal,
-               Self.sameFrozenAttribution(quarantined, result) == false {
-                contractViolation = true
-                state.preLoginConsumableFinalRejected = true
-                state.recoveryPermanentlyStopped = true
-                state.nextRecoveryAt = nil
-                return
-            }
-            state.pendingLoginFinal = result
-        }) != nil else {
-            throw LinkAttributionError.invalidResponse
-        }
-        if contractViolation { throw LinkAttributionError.invalidResponse }
+    /// 可消费 FINAL 只认宿主在真实登录回调中原子保存的本地账号作用域；历史移动端确认永不参与判断。
+    private static func hasTrustedAccountBinding(_ state: InstallationState) -> Bool {
+        state.deliveryAccountScopeTrusted
+            && state.deliveryAccountScope?.isEmpty == false
+            && state.loginEventId != nil
+            && state.loginOccurredAt != nil
     }
 
     /**
@@ -1847,18 +1653,7 @@ public final class LinkAttribution: @unchecked Sendable {
                 throw DeferredAttributionDecision(retryAfterMs: result.retryAfterMs)
             }
         }
-        if result.isConsumableFinal, state?.loginConfirmation == nil {
-            if state?.loginEventId != nil,
-               state?.loginOccurredAt != nil,
-               state?.loginSubmissionAttemptedAt != nil {
-                // 服务端可能已受理登录，但响应在弱网中丢失；同一 FINAL 必须等幂等确认恢复后再交付。
-                throw PendingLoginConfirmationDecision(retryAfterMs: result.retryAfterMs)
-            }
-            throw LinkAttributionError.invalidResponse
-        }
-        if let quarantined = state?.pendingLoginFinal,
-           Self.sameFrozenAttribution(quarantined, result) == false {
-            // FINAL 首次被看到时即已不可变；登录确认恢复只能解封同一份冻结结果。
+        if result.isConsumableFinal, state.map(Self.hasTrustedAccountBinding) != true {
             throw LinkAttributionError.invalidResponse
         }
     }
@@ -1875,6 +1670,7 @@ public final class LinkAttribution: @unchecked Sendable {
     private static func sameFrozenAttribution(_ expected: AttributionResult, _ actual: AttributionResult) -> Bool {
         actual.isFinal
             && expected.attributionId == actual.attributionId
+            && expected.decisionId == actual.decisionId
             && expected.processState == actual.processState
             && expected.outcome == actual.outcome
             && expected.status == actual.status
@@ -2104,10 +1900,24 @@ public final class LinkAttribution: @unchecked Sendable {
         // 国家/地区与时区默认不采集，避免为极低权重扩大隐私面；业务如确有依据仍可显式传入 signals。
         let locale = Self.primaryLanguage(Locale.preferredLanguages.first)
         #if canImport(UIKit)
-        return ClientSignals(locale: locale, osMajor: UIDevice.current.systemVersion.split(separator: ".").first.map(String.init), deviceClass: UIDevice.current.userInterfaceIdiom == .pad ? "TABLET" : "PHONE")
+        return ClientSignals(
+            locale: locale,
+            osMajor: UIDevice.current.systemVersion.split(separator: ".").first.map(String.init),
+            deviceClass: UIDevice.current.userInterfaceIdiom == .pad ? "TABLET" : "PHONE",
+            screenBucket: Self.screenBucketForWidth(UIScreen.main.bounds.width)
+        )
         #else
         return ClientSignals(locale: locale, osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion.description, deviceClass: "DESKTOP")
         #endif
+    }
+
+    /// 只保留 point 宽度区间；原始尺寸、scale、分辨率和设备型号均不进入请求。
+    static func screenBucketForWidth(_ width: Double) -> ScreenBucket? {
+        guard width > 0, width.isFinite else { return nil }
+        if width < 600 { return .compact }
+        if width < 840 { return .medium }
+        if width < 1_200 { return .expanded }
+        return .large
     }
 
     private static func primaryLanguage(_ value: String?) -> String? {
