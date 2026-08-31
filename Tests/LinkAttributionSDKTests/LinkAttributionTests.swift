@@ -268,7 +268,7 @@ final class LinkAttributionTests: XCTestCase {
     }
 
     func testCacheScopeMustExplicitlySeparateProjectEnvironmentAndApplication() throws {
-        for cacheScope in ["", "icarder", "icarder/test", "icarder//ios", "icarder/test/ios/含中文"] {
+        for cacheScope in ["", "projecta", "projecta/test", "projecta//ios", "projecta/test/ios/含中文"] {
             XCTAssertThrowsError(
                 try LinkAttribution(
                     configuration: .init(
@@ -288,7 +288,7 @@ final class LinkAttributionTests: XCTestCase {
                     apiBaseURL: URL(string: "https://api.example.test")!,
                     sdkKey: "ios-key",
                     appVersion: "2.10.4",
-                    cacheScope: "icarder/test/ios"
+                    cacheScope: "projecta/test/ios"
                 ),
                 userDefaults: defaults
             )
@@ -367,7 +367,7 @@ final class LinkAttributionTests: XCTestCase {
         func finalPayload(attributedAt: String) throws -> Data {
             let match: [String: Any] = [
                 "linkId": "00000000-0000-4000-8000-000000000301",
-                "ruleKey": "icard_share",
+                "ruleKey": "project_share",
                 "externalIdentifier": "share-123",
                 "confidenceBand": "HIGH",
                 "attributedAt": attributedAt,
@@ -406,10 +406,10 @@ final class LinkAttributionTests: XCTestCase {
     }
 
     func testWireRequiresBusinessIdentityAndRejectsInvalidUUIDs() throws {
-        let valid = #"{"attributionId":"00000000-0000-4000-8000-000000000221","decisionId":"10000000-0000-4000-8000-000000000221","processState":"FINAL","isFinal":true,"outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"icard_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"icard_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":1,"navigationSessionId":"00000000-0000-4000-8000-000000000421"}"#
+        let valid = #"{"attributionId":"00000000-0000-4000-8000-000000000221","decisionId":"10000000-0000-4000-8000-000000000221","processState":"FINAL","isFinal":true,"outcome":"MATCHED","status":"PROBABILISTIC_MATCH","resolverType":"IOS_USER_PROVIDED_LINK","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:01Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"project_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000321","ruleKey":"project_share","externalIdentifier":"share-123","confidenceBand":"HIGH","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":1,"navigationSessionId":"00000000-0000-4000-8000-000000000421"}"#
 
         let result = try JSONDecoder().decode(AttributionResult.self, from: Data(valid.utf8))
-        XCTAssertEqual(result.finalMatches.first?.ruleKey, "icard_share")
+        XCTAssertEqual(result.finalMatches.first?.ruleKey, "project_share")
         XCTAssertEqual(result.finalMatches.first?.externalIdentifier, "share-123")
         XCTAssertEqual(result.attributionId, "00000000-0000-4000-8000-000000000221")
         XCTAssertEqual(result.decisionId, "10000000-0000-4000-8000-000000000221")
@@ -420,9 +420,9 @@ final class LinkAttributionTests: XCTestCase {
             valid.replacingOccurrences(of: "00000000-0000-4000-8000-000000000421", with: "invalid-navigation-id"),
             valid.replacingOccurrences(of: "10000000-0000-4000-8000-000000000221", with: "invalid-decision-id"),
             valid.replacingOccurrences(of: #""decisionId":"10000000-0000-4000-8000-000000000221","#, with: ""),
-            valid.replacingOccurrences(of: ",\"ruleKey\":\"icard_share\"", with: ""),
+            valid.replacingOccurrences(of: ",\"ruleKey\":\"project_share\"", with: ""),
             valid.replacingOccurrences(of: ",\"externalIdentifier\":\"share-123\"", with: ""),
-            valid.replacingOccurrences(of: "\"ruleKey\":\"icard_share\"", with: "\"ruleKey\":\"   \""),
+            valid.replacingOccurrences(of: "\"ruleKey\":\"project_share\"", with: "\"ruleKey\":\"   \""),
             valid.replacingOccurrences(of: "\"externalIdentifier\":\"share-123\"", with: "\"externalIdentifier\":\"   \""),
         ]
         for json in invalidResponses {
@@ -435,7 +435,7 @@ final class LinkAttributionTests: XCTestCase {
             let matches: [[String: Any]] = (1...matchCount).map { index in
                 [
                     "linkId": String(format: "00000000-0000-4000-8000-%012d", index),
-                    "ruleKey": "icard_share",
+                    "ruleKey": "project_share",
                     "externalIdentifier": "share-\(index)",
                     "confidenceBand": "HIGH",
                     "attributedAt": "2026-08-24T08:00:01Z",
@@ -846,7 +846,7 @@ final class LinkAttributionTests: XCTestCase {
     func testMultipleMatchesExposeOnlySafeBusinessDelivery() async throws {
         let result = try JSONDecoder().decode(
             AttributionResult.self,
-            from: Data(#"{"attributionId":"00000000-0000-4000-8000-000000000206","decisionId":"10000000-0000-4000-8000-000000000206","processState":"FINAL","isFinal":true,"outcome":"MULTIPLE_MATCHES","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:02Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"icard_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"icard_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"icard_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"icard_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":2,"linkId":"ignored-legacy","route":"/ignored-legacy"}"#.utf8)
+            from: Data(#"{"attributionId":"00000000-0000-4000-8000-000000000206","decisionId":"10000000-0000-4000-8000-000000000206","processState":"FINAL","isFinal":true,"outcome":"MULTIPLE_MATCHES","status":"PROBABILISTIC_MATCH","resolverType":"IOS_PROBABILISTIC_INSTALL","decisionSequence":1,"occurredAt":"2026-08-24T08:00:00Z","reportedAt":"2026-08-24T08:00:01Z","finalizedAt":"2026-08-24T08:00:02Z","retryAfterMs":0,"finalMatches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"project_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"project_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matches":[{"linkId":"00000000-0000-4000-8000-000000000301","ruleKey":"project_share","externalIdentifier":"share-1","confidenceBand":"HIGH","route":"/card/1","attributedAt":"2026-08-24T08:00:01Z"},{"linkId":"00000000-0000-4000-8000-000000000302","ruleKey":"project_share","externalIdentifier":"share-2","confidenceBand":"HIGH","route":"/card/2","attributedAt":"2026-08-24T08:00:01Z"}],"matchCount":2,"linkId":"ignored-legacy","route":"/ignored-legacy"}"#.utf8)
         )
 
         XCTAssertEqual(result.finalMatches.map(\.externalIdentifier), ["share-1", "share-2"])
@@ -985,7 +985,7 @@ final class LinkAttributionTests: XCTestCase {
         }
 
         let result = await (try makeSdk(userProvidedEvidenceEnabled: true)).submitUserProvidedEvidence(
-            .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "share-123")
+            .externalIdentifier(ruleKey: "project_share", externalIdentifier: "share-123")
         )
 
         guard case .accepted = result else { return XCTFail("evidence should be accepted") }
@@ -994,7 +994,7 @@ final class LinkAttributionTests: XCTestCase {
         let evidence = try XCTUnwrap(payload["evidence"] as? [String: Any])
         XCTAssertEqual(Set(evidence.keys), ["source", "ruleKey", "externalIdentifier"])
         XCTAssertEqual(evidence["source"] as? String, "IOS_USER_PASTE")
-        XCTAssertEqual(evidence["ruleKey"] as? String, "icard_share")
+        XCTAssertEqual(evidence["ruleKey"] as? String, "project_share")
         XCTAssertEqual(evidence["externalIdentifier"] as? String, "share-123")
         XCTAssertNil(evidence["clipboard"])
         XCTAssertNil(evidence["rawText"])
@@ -1192,10 +1192,10 @@ final class LinkAttributionTests: XCTestCase {
         let sdk = try makeSdk(userProvidedEvidenceEnabled: true)
 
         let rejectedEvidence: [IOSUserProvidedEvidence] = [
-            .linkToken("ICard 分享邀请\n https://go.example.test/s/link_token_123 \n立即打开"),
-            .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "分享码"),
-            .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "share:123"),
-            .externalIdentifier(ruleKey: "icard_share", externalIdentifier: "-share"),
+            .linkToken("Project share link\n https://go.example.test/s/link_token_123 \n立即打开"),
+            .externalIdentifier(ruleKey: "project_share", externalIdentifier: "分享码"),
+            .externalIdentifier(ruleKey: "project_share", externalIdentifier: "share:123"),
+            .externalIdentifier(ruleKey: "project_share", externalIdentifier: "-share"),
         ]
         for evidence in rejectedEvidence {
             let result = await sdk.submitUserProvidedEvidence(evidence)
@@ -1704,7 +1704,7 @@ final class LinkAttributionTests: XCTestCase {
         var finalMatches = object["finalMatches"] as? [[String: Any]] ?? []
         for index in finalMatches.indices {
             if finalMatches[index]["ruleKey"] == nil {
-                finalMatches[index]["ruleKey"] = "icard_share"
+                finalMatches[index]["ruleKey"] = "project_share"
             }
             if finalMatches[index]["externalIdentifier"] == nil {
                 finalMatches[index]["externalIdentifier"] = "test-share-\(index)"

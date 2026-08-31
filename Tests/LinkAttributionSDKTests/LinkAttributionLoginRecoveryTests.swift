@@ -303,7 +303,7 @@ final class LinkAttributionLoginRecoveryTests: XCTestCase {
         XCTAssertNil(current["terminalResult"])
     }
 
-    func testConsumableFinalWithoutLocalBindingFailsClosedButEmptyFinalRemainsDiagnostic() async throws {
+    func testBusinessFinalWithoutLocalBindingFailsClosedAndPreLoginEmptyFinalsCannotBeClaimedLater() async throws {
         let matchedId = "00000000-0000-4000-8000-000000000701"
         ServerLoginTruthURLProtocol.handler = { request in
             try Self.matchedFinalResponse(request, attributionId: matchedId, sequence: 1, share: "unbound")
@@ -317,26 +317,73 @@ final class LinkAttributionLoginRecoveryTests: XCTestCase {
         }
         XCTAssertNil(try matched.pendingFinalDelivery(accountScope: "account_scope_0701"))
 
-        let emptyId = "00000000-0000-4000-8000-000000000702"
-        ServerLoginTruthURLProtocol.handler = { request in
-            try Self.emptyFinalResponse(request, attributionId: emptyId, outcome: "NO_MATCH", status: "NO_MATCH")
-        }
-        let empty = try makeSdk(storageNamespace: "server-truth-empty")
-        let result = try await empty.resolveInstallation()
-        XCTAssertTrue(result.isFinal)
-        XCTAssertEqual(result.outcome, .noMatch)
-        XCTAssertTrue(result.finalMatches.isEmpty)
-        XCTAssertNil(try empty.pendingFinalDelivery(accountScope: "account_scope_0702"))
+        let cases: [(suffix: Int, outcome: String, status: String, expected: AttributionOutcome)] = [
+            (702, "NO_MATCH", "NO_MATCH", .noMatch),
+            (703, "UNRESOLVED", "AMBIGUOUS", .unresolved),
+            (704, "RISK_BLOCKED", "MANUAL_REJECT", .riskBlocked),
+            (705, "EXPIRED", "EXPIRED", .expired),
+        ]
+        for item in cases {
+            let attributionId = String(format: "00000000-0000-4000-8000-%012d", item.suffix)
+            let namespace = "server-truth-prelogin-empty-\(item.suffix)"
+            let accountScope = "account_scope_prelogin_\(item.suffix)"
+            ServerLoginTruthURLProtocol.handler = { request in
+                try Self.emptyFinalResponse(request, attributionId: attributionId, outcome: item.outcome, status: item.status)
+            }
 
-        let expiredId = "00000000-0000-4000-8000-000000000703"
-        ServerLoginTruthURLProtocol.handler = { request in
-            try Self.emptyFinalResponse(request, attributionId: expiredId, outcome: "EXPIRED", status: "EXPIRED")
+            let sdk = try makeSdk(storageNamespace: namespace)
+            let diagnostic = try await sdk.resolveInstallation()
+            XCTAssertTrue(diagnostic.isFinal)
+            XCTAssertEqual(diagnostic.outcome, item.expected)
+            XCTAssertTrue(diagnostic.finalMatches.isEmpty)
+            XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: accountScope))
+
+            try sdk.recordAuthenticatedLogin(accountScope: accountScope)
+            XCTAssertNil(try sdk.pendingFinalDelivery(accountScope: accountScope), "登录前形成的空 FINAL 不得被后来账号追认")
+            let relaunched = try makeSdk(storageNamespace: namespace)
+            XCTAssertNil(try relaunched.pendingFinalDelivery(accountScope: accountScope), "抑制边界必须跨进程持久化")
+            XCTAssertFalse(try relaunched.isFinalBound(to: accountScope))
         }
-        let expired = try makeSdk(storageNamespace: "server-truth-expired")
-        let expiredResult = try await expired.resolveInstallation()
-        XCTAssertEqual(expiredResult.outcome, .expired)
-        XCTAssertTrue(expiredResult.finalMatches.isEmpty)
-        XCTAssertNil(try expired.pendingFinalDelivery(accountScope: "account_scope_0703"))
+    }
+
+    func testAuthenticatedEmptyFinalsPersistAcrossRestartAndAck() async throws {
+        let cases: [(suffix: Int, outcome: String, status: String, expected: AttributionOutcome)] = [
+            (711, "NO_MATCH", "NO_MATCH", .noMatch),
+            (712, "UNRESOLVED", "AMBIGUOUS", .unresolved),
+            (713, "RISK_BLOCKED", "MANUAL_REJECT", .riskBlocked),
+            (714, "EXPIRED", "EXPIRED", .expired),
+        ]
+        for item in cases {
+            let attributionId = String(format: "00000000-0000-4000-8000-%012d", item.suffix)
+            let namespace = "server-truth-authenticated-empty-\(item.suffix)"
+            let accountScope = "account_scope_authenticated_\(item.suffix)"
+            ServerLoginTruthURLProtocol.handler = { request in
+                try Self.emptyFinalResponse(request, attributionId: attributionId, outcome: item.outcome, status: item.status)
+            }
+
+            let sdk = try makeSdk(storageNamespace: namespace)
+            try sdk.recordAuthenticatedLogin(accountScope: accountScope)
+            let diagnostic = try await sdk.resolveInstallation()
+            XCTAssertEqual(diagnostic.outcome, item.expected)
+            XCTAssertTrue(diagnostic.finalMatches.isEmpty)
+            XCTAssertEqual(diagnostic.finalMatchesVersion, 1)
+
+            let delivery = try XCTUnwrap(sdk.pendingFinalDelivery(accountScope: accountScope))
+            XCTAssertEqual(delivery.deliveryId, "\(attributionId):1")
+            XCTAssertEqual(delivery.result.decisionId, Self.decisionId(for: attributionId))
+            XCTAssertEqual(delivery.result.finalMatchesVersion, 1)
+            XCTAssertTrue(delivery.result.finalMatches.isEmpty)
+            XCTAssertEqual(delivery.result.outcome, item.expected)
+
+            let relaunched = try makeSdk(storageNamespace: namespace)
+            XCTAssertEqual(try relaunched.pendingFinalDelivery(accountScope: accountScope)?.deliveryId, delivery.deliveryId)
+            XCTAssertThrowsError(
+                try relaunched.acknowledgeFinalDelivery(deliveryId: delivery.deliveryId, accountScope: "wrong_account_scope_\(item.suffix)")
+            )
+            try relaunched.acknowledgeFinalDelivery(deliveryId: delivery.deliveryId, accountScope: accountScope)
+            XCTAssertNil(try relaunched.pendingFinalDelivery(accountScope: accountScope))
+            XCTAssertTrue(try relaunched.isFinalBound(to: accountScope))
+        }
     }
 
     func testV3MigrationRevokesMobileConfirmationAndSuppressesHistoricalBusinessFinal() throws {
@@ -463,7 +510,7 @@ final class LinkAttributionLoginRecoveryTests: XCTestCase {
     ) -> [String: Any] {
         let match: [String: Any] = [
             "linkId": "00000000-0000-4000-8000-000000000901",
-            "ruleKey": "icard_share",
+            "ruleKey": "project_share",
             "externalIdentifier": share,
             "confidenceBand": "HIGH",
             "route": "/card/1",

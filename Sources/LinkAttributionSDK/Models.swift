@@ -191,9 +191,20 @@ public struct AttributionResult: Codable, Equatable, Sendable {
     /// 只有服务端冻结的 FINAL 结果才可进入本地终态缓存或交给业务权益接口。
     public var isFinal: Bool { processState == .final }
 
-    /// 只有包含冻结匹配的 FINAL 才属于业务可消费结果；无匹配、过期等 FINAL 可在登录前用于诊断。
-    var isConsumableFinal: Bool {
+    /// 只有包含冻结匹配的 FINAL 才可能触发业务权益；用于保持旧公开诊断入口的隐藏边界。
+    var hasBusinessMatchesFinal: Bool {
         processState == .final && (outcome == .matched || outcome == .multipleMatches)
+    }
+
+    /// 所有带精确 Decision 身份的合法 FINAL 都应进入账号绑定 outbox。
+    /// 空匹配终态只用于可靠结束业务待办，绝不能据此发放权益。
+    var isDeliverableFinal: Bool {
+        processState == .final && outcome != nil && decisionId != nil && decisionSequence > 0
+    }
+
+    /// 业务 claim 必须精确提交并校验的 FINAL 版本；非可交付状态返回 nil。
+    public var finalMatchesVersion: Int? {
+        isDeliverableFinal ? decisionSequence : nil
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -664,7 +675,8 @@ public enum AttributionRecoveryPhase: String, Equatable, Sendable {
     case waitingForLogin = "WAITING_FOR_LOGIN"
     /// 本地账号已原子绑定，平台尚未返回由 Server Key 事实解锁的不可变 FINAL。
     case waitingForFinal = "WAITING_FOR_FINAL"
-    /// 已得到并持久化不可变 FINAL；可消费结果的 `result` 为空，只能通过 `pendingFinalDelivery(accountScope:)` 读取业务待办。
+    /// 已得到并持久化不可变 FINAL；空匹配 FINAL 可同时出现在 `result` 供诊断，但业务必须始终检查
+    /// `pendingFinalDelivery(accountScope:)` 并完成 claim/ack，不能把诊断返回当作待办已结束。
     case final = "FINAL"
     /// 仅遇到允许自动重试的临时失败，并已持久化下一次退避时间。
     case retryScheduled = "RETRY_SCHEDULED"
@@ -701,7 +713,7 @@ public struct AttributionRecoveryOutcome: Equatable, Sendable {
 public enum LinkAttributionError: Error, Equatable, Sendable {
     case invalidConfiguration(String)
     case invalidArgument(String)
-    /// 已冻结可消费 FINAL，但业务只能通过账号绑定的 `pendingFinalDelivery` outbox 读取并 ack。
+    /// 已冻结含业务匹配的 FINAL；业务只能通过账号绑定的 `pendingFinalDelivery` outbox 读取并 ack。
     case businessDeliveryRequired
     case timeout
     case network(String)

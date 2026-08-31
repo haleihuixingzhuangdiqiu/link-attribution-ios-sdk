@@ -87,13 +87,13 @@ public final class LinkAttribution: @unchecked Sendable {
         var lastDecisionSequence: Int?
         /// 登录或新证据受理前已见到的序号；后续结果必须越过该序号才可重新交付。
         var invalidatedThroughDecisionSequence: Int?
-        /// 平台若在登录门槛前误发可消费 FINAL，违反 FINAL 不可重开契约；本安装永久禁止交付该归因。
+        /// 平台若在登录门槛前误发含业务匹配的 FINAL，违反 FINAL 不可重开契约；本安装永久禁止交付该归因。
         var preLoginConsumableFinalRejected: Bool
         /// 宿主传入的本地脱敏账号作用域；只用于把 FINAL 交付给触发登录事实的同一账号。
         var deliveryAccountScope: String?
         /// 账号作用域是否由当前或兼容版本显式绑定；缺失/损坏的旧缓存必须按未绑定处理。
         var deliveryAccountScopeTrusted: Bool
-        /// 在账号绑定前已经形成的可消费 FINAL；仅保留诊断，不得在事后绑定给任意账号。
+        /// 在账号绑定前已经形成的可交付 FINAL；仅保留诊断，不得在事后绑定给任意账号。
         var suppressedUnboundDeliveryId: String?
         /// 宿主已经确认业务消费的最后一条稳定交付 ID；不清除 SDK 的终态诊断缓存。
         var acknowledgedDeliveryId: String?
@@ -481,7 +481,7 @@ public final class LinkAttribution: @unchecked Sendable {
         catch LinkAttributionError.http(let status) where status == 404 { return nil }
     }
 
-    /// 发起或恢复首次安装归因；可消费 FINAL 会写入账号 outbox 并抛出 `.businessDeliveryRequired`，不会从本入口暴露 share code。
+    /// 发起或恢复首次安装归因；合法 FINAL 会写入账号 outbox。含业务匹配时抛出 `.businessDeliveryRequired`，空匹配时仅返回诊断结果。
     public func resolveInstallation(signals: ClientSignals? = nil) async throws -> AttributionResult {
         do {
             let result = try await stateNetworkGate.withLock {
@@ -524,7 +524,7 @@ public final class LinkAttribution: @unchecked Sendable {
                 return terminal
             } catch {
                 // 旧缓存或本地账号门槛不再合法时保留事件与发生时间，只清结果并回源同一 attribution。
-                let rejectedPreLoginFinal = terminal.isConsumableFinal && Self.hasTrustedAccountBinding(state) == false
+                let rejectedPreLoginFinal = terminal.hasBusinessMatchesFinal && Self.hasTrustedAccountBinding(state) == false
                 try mutateExistingState(expectedEventId: state.eventId) { current in
                     current.terminalResult = nil
                     current.lastDecisionSequence = Self.maximumSequence(current.lastDecisionSequence, terminal.decisionSequence)
@@ -582,7 +582,7 @@ public final class LinkAttribution: @unchecked Sendable {
             try validateAttribution(result, for: responseState)
         } catch {
             // 合法 wire 即使越过本地账号门槛，也先保留 attributionId，宿主仍可诊断同一安装。
-            let rejectedPreLoginFinal = result.isConsumableFinal && Self.hasTrustedAccountBinding(responseState) == false
+            let rejectedPreLoginFinal = result.hasBusinessMatchesFinal && Self.hasTrustedAccountBinding(responseState) == false
             try mutateExistingState(expectedEventId: state.eventId) { current in
                 current.attributionId = result.attributionId
                 current.lastDecisionSequence = Self.maximumSequence(current.lastDecisionSequence, result.decisionSequence)
@@ -656,7 +656,7 @@ public final class LinkAttribution: @unchecked Sendable {
         }
     }
 
-    /// 查询服务端最新追加决策；可消费 FINAL 只进入账号 outbox，本入口抛出 `.businessDeliveryRequired`。
+    /// 查询服务端最新追加决策；合法 FINAL 会写入账号 outbox。含业务匹配时抛出 `.businessDeliveryRequired`，空匹配时仅返回诊断结果。
     public func getAttribution(attributionId: String) async throws -> AttributionResult {
         do {
             let result = try await stateNetworkGate.withLock {
@@ -704,7 +704,7 @@ public final class LinkAttribution: @unchecked Sendable {
         } catch {
             if result.attributionId == attributionId,
                currentState.terminalResult?.isFinal != true {
-                let rejectedPreLoginFinal = result.isConsumableFinal && Self.hasTrustedAccountBinding(currentState) == false
+                let rejectedPreLoginFinal = result.hasBusinessMatchesFinal && Self.hasTrustedAccountBinding(currentState) == false
                 try mutateExistingState(expectedEventId: currentState.eventId) { state in
                     guard state.attributionId == attributionId else { return }
                     state.lastDecisionSequence = Self.maximumSequence(state.lastDecisionSequence, result.decisionSequence)
@@ -732,7 +732,7 @@ public final class LinkAttribution: @unchecked Sendable {
         return result
     }
 
-    /// 轮询尚未冻结的归因；可消费 FINAL 只进入账号 outbox，本入口抛出 `.businessDeliveryRequired`。
+    /// 轮询尚未冻结的归因；合法 FINAL 会写入账号 outbox。含业务匹配时抛出 `.businessDeliveryRequired`，空匹配时仅返回诊断结果。
     public func waitForAttribution(attributionId: String, timeout: TimeInterval = 15, interval: TimeInterval = 1) async throws -> AttributionResult {
         guard timeout.isFinite, timeout > 0, interval.isFinite, interval > 0 else {
             throw LinkAttributionError.invalidArgument("timeout and interval must be finite positive seconds")
@@ -969,13 +969,13 @@ public final class LinkAttribution: @unchecked Sendable {
                         || current.invalidatedThroughDecisionSequence.map { response.decisionSequence <= $0 } ?? false
                     if sequenceIsInvalid {
                         // FINAL 不能以倒退/失效序号绕过门槛；业务 FINAL 违例后永久 fail-closed。
-                        if response.isConsumableFinal {
+                        if response.hasBusinessMatchesFinal {
                             current.preLoginConsumableFinalRejected = true
                         }
                         current.recoveryPermanentlyStopped = true
                         current.nextRecoveryAt = nil
                         disposition = .rejected
-                    } else if response.isConsumableFinal, Self.hasTrustedAccountBinding(current) == false {
+                    } else if response.hasBusinessMatchesFinal, Self.hasTrustedAccountBinding(current) == false {
                         // Server Key 确认可以先于本机回调完成，但本地未原子绑定账号时绝不形成业务交付。
                         current.preLoginConsumableFinalRejected = true
                         current.recoveryPermanentlyStopped = true
@@ -991,7 +991,7 @@ public final class LinkAttribution: @unchecked Sendable {
                         )
                         current.nextRecoveryAt = nil
                         current.recoveryAttempt = 0
-                        if response.isConsumableFinal == false {
+                        if response.hasBusinessMatchesFinal == false {
                             disposition = .rejected
                         }
                     }
@@ -1081,7 +1081,8 @@ public final class LinkAttribution: @unchecked Sendable {
      安装查询 → FINAL 轮询”顺序执行，并持久化指数退避。前台和网络恢复信号可提前
      唤醒一次，定时触发严格遵守 `nextRetryAt`。所有失败都旁路宿主原业务；只有合法 FINAL 会
      进入本地 outbox，业务仍须调用 `pendingFinalDelivery(accountScope:)` 并在真实处理成功后 ack。
-     可消费 FINAL 的 `phase` 为 `.final`，但 `result` 固定为 `nil`，避免恢复入口绕过账号 outbox。
+     含业务匹配的 FINAL 返回 `.final` 且 `result == nil`；空匹配 FINAL 可同时返回脱敏诊断结果。
+     两者都必须从 `pendingFinalDelivery(accountScope:)` 完成精确 claim/ack，不能用诊断结果替代 outbox。
 
      - Parameters:
        - trigger: 宿主观察到的真实生命周期/网络触发，不由 SDK 猜测。
@@ -1136,7 +1137,7 @@ public final class LinkAttribution: @unchecked Sendable {
             try clearRecoverySchedule(expectedEventId: expectedEventId)
             return AttributionRecoveryOutcome(
                 phase: .final,
-                result: terminal.isConsumableFinal ? nil : terminal
+                result: terminal.hasBusinessMatchesFinal ? nil : terminal
             )
         }
         if let state = loadState(), state.recoveryCredentialScope != nil,
@@ -1188,14 +1189,14 @@ public final class LinkAttribution: @unchecked Sendable {
                 try clearRecoverySchedule(expectedEventId: expectedEventId)
                 return AttributionRecoveryOutcome(
                     phase: .final,
-                    result: final.isConsumableFinal ? nil : final
+                    result: final.hasBusinessMatchesFinal ? nil : final
                 )
             }
             if current.isFinal {
                 try clearRecoverySchedule(expectedEventId: expectedEventId)
                 return AttributionRecoveryOutcome(
                     phase: .final,
-                    result: current.isConsumableFinal ? nil : current
+                    result: current.hasBusinessMatchesFinal ? nil : current
                 )
             }
             guard hasRecordedLoginCompletedFact else {
@@ -1258,14 +1259,14 @@ public final class LinkAttribution: @unchecked Sendable {
         throw LinkAttributionError.invalidArgument("split account binding is retired; use recordAuthenticatedLogin(accountScope:)")
     }
 
-    /// 返回当前账号仍待业务确认的 FINAL；无匹配、账号不符或已 ack 时返回 `nil`。
+    /// 返回当前账号仍待业务确认的 FINAL；账号不符、缺少精确 Decision 或已 ack 时返回 `nil`。
     public func pendingFinalDelivery(accountScope: String) throws -> AttributionDelivery? {
         let normalized = try validatedAccountScope(accountScope)
         guard let state = try loadStateStrict(), state.deliveryAccountScopeTrusted,
               state.deliveryAccountScope == normalized,
               Self.hasTrustedAccountBinding(state),
               state.preLoginConsumableFinalRejected == false,
-              let result = state.terminalResult, result.isConsumableFinal,
+              let result = state.terminalResult, result.isDeliverableFinal,
               result.decisionId != nil,
               let deliveryId = Self.deliveryId(for: result),
               state.suppressedUnboundDeliveryId != deliveryId,
@@ -1443,10 +1444,14 @@ public final class LinkAttribution: @unchecked Sendable {
                     }
                 }
                 // v3 及更早版本曾把移动端登录响应当作可信门槛。迁移时撤销该能力：历史确认、待解封
-                // FINAL 和永久拒绝都不再参与恢复；已缓存的业务 FINAL 则永久标记为不可再次交付。
-                if let terminal = state.terminalResult, terminal.isConsumableFinal {
-                    state.suppressedUnboundDeliveryId = Self.deliveryId(for: terminal)
-                    if terminal.decisionId == nil {
+                // FINAL 和永久拒绝都不再参与恢复；能形成精确 deliveryId 的历史 FINAL 一律永久抑制，
+                // 避免升级后被任意账号追认。缺 decisionId 的历史匹配型 FINAL 连诊断缓存也不能保留。
+                if let terminal = state.terminalResult {
+                    if terminal.isFinal, terminal.outcome != nil, terminal.decisionSequence > 0 {
+                        let deliveryId = "\(terminal.attributionId.lowercased()):\(terminal.decisionSequence)"
+                        state.suppressedUnboundDeliveryId = deliveryId
+                    }
+                    if terminal.hasBusinessMatchesFinal, terminal.decisionId == nil {
                         state.terminalResult = nil
                     }
                 }
@@ -1491,7 +1496,7 @@ public final class LinkAttribution: @unchecked Sendable {
                   state.pendingLoginFinal == nil,
                   state.loginConfirmationPermanentlyRejected == false,
                   state.loginRejectionCredentialScope == nil,
-                  state.terminalResult?.isConsumableFinal != true || state.terminalResult?.decisionId != nil,
+                  state.terminalResult?.hasBusinessMatchesFinal != true || state.terminalResult?.decisionId != nil,
                   state.recoveryAttempt >= 0,
                   state.deliveryAccountScopeTrusted == false || state.deliveryAccountScope != nil
             else {
@@ -1591,7 +1596,7 @@ public final class LinkAttribution: @unchecked Sendable {
         state.loginSubmissionAttemptedAt = nil
     }
 
-    /// 在本地绑定脱敏账号；绑定前已经形成的业务 FINAL 永久抑制，禁止任意后来账号认领。
+    /// 在本地绑定脱敏账号；绑定前已经形成的任何可交付 FINAL 永久抑制，禁止后来账号认领。
     private func bindAuthenticatedAccount(_ normalized: String, to state: inout InstallationState) throws {
         if state.deliveryAccountScopeTrusted,
            let existing = state.deliveryAccountScope,
@@ -1600,14 +1605,14 @@ public final class LinkAttribution: @unchecked Sendable {
         }
         if state.deliveryAccountScopeTrusted == false,
            let result = state.terminalResult,
-           result.isConsumableFinal {
-            state.suppressedUnboundDeliveryId = Self.deliveryId(for: result)
+           let deliveryId = Self.deliveryId(for: result) {
+            state.suppressedUnboundDeliveryId = deliveryId
         }
         state.deliveryAccountScope = normalized
         state.deliveryAccountScopeTrusted = true
     }
 
-    /// 可消费 FINAL 只认宿主在真实登录回调中原子保存的本地账号作用域；历史移动端确认永不参与判断。
+    /// 可交付 FINAL 只认宿主在真实登录回调中原子保存的本地账号作用域；历史移动端确认永不参与判断。
     private static func hasTrustedAccountBinding(_ state: InstallationState) -> Bool {
         state.deliveryAccountScopeTrusted
             && state.deliveryAccountScope?.isEmpty == false
@@ -1616,8 +1621,8 @@ public final class LinkAttribution: @unchecked Sendable {
     }
 
     /**
-     校验结果属于当前安装且决策序号不倒退。登录前仅拒绝包含匹配关系的可消费 FINAL；
-     `NO_MATCH/UNRESOLVED/RISK_BLOCKED/EXPIRED` 可用于诊断，但不会触发任何业务权益。
+     校验结果属于当前安装且决策序号不倒退。登录前拒绝包含业务匹配的 FINAL；
+     `NO_MATCH/UNRESOLVED/RISK_BLOCKED/EXPIRED` 可用于诊断，但会被持久抑制，不能由后来账号追认。
      */
     private func validateAttribution(
         _ result: AttributionResult,
@@ -1628,7 +1633,7 @@ public final class LinkAttribution: @unchecked Sendable {
             throw LinkAttributionError.invalidResponse
         }
         if state?.preLoginConsumableFinalRejected == true {
-            // FINAL 不可重开；门槛前误发过可消费 FINAL 后，本安装后续任何决策都不再可信。
+            // FINAL 不可重开；门槛前误发过含业务匹配的 FINAL 后，本安装后续任何决策都不再可信。
             throw LinkAttributionError.invalidResponse
         }
         var isExactCachedTerminal = false
@@ -1653,14 +1658,14 @@ public final class LinkAttribution: @unchecked Sendable {
                 throw DeferredAttributionDecision(retryAfterMs: result.retryAfterMs)
             }
         }
-        if result.isConsumableFinal, state.map(Self.hasTrustedAccountBinding) != true {
+        if result.hasBusinessMatchesFinal, state.map(Self.hasTrustedAccountBinding) != true {
             throw LinkAttributionError.invalidResponse
         }
     }
 
     /// 旧查询入口只返回无业务匹配的诊断结果；含 share code 的 FINAL 必须从账号绑定 outbox 读取。
     private func publicDiagnosticResult(_ result: AttributionResult) throws -> AttributionResult {
-        guard result.isConsumableFinal == false else {
+        guard result.hasBusinessMatchesFinal == false else {
             throw LinkAttributionError.businessDeliveryRequired
         }
         return result
@@ -1736,9 +1741,9 @@ public final class LinkAttribution: @unchecked Sendable {
         return normalized
     }
 
-    /// 冻结决策的稳定交付 ID；缺少合法序号的旧缓存不得进入业务 outbox。
+    /// 冻结决策的稳定交付 ID；只有全部合法且带精确身份的 FINAL 才能进入业务 outbox。
     private static func deliveryId(for result: AttributionResult) -> String? {
-        guard result.isConsumableFinal, result.decisionSequence > 0 else { return nil }
+        guard result.isDeliverableFinal else { return nil }
         return "\(result.attributionId.lowercased()):\(result.decisionSequence)"
     }
     /// 运行参数使用值类型 JSON 枚举，循环引用和任意对象无法进入公共 API；这里再校验深度、节点、有限数值和实际 UTF-8 编码大小。
