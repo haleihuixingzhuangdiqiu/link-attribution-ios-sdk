@@ -1,5 +1,9 @@
 # iOS Swift SDK
 
+## License
+
+Licensed under the [Apache License, Version 2.0](./LICENSE). See [NOTICE](./NOTICE) for attribution information.
+
 支持项目自有 Universal Link、首次启动的 iOS 概率归因、登录门槛、持久重试、FINAL 待交付队列和 `UserDefaults` 本地恢复。Swift Package 最低 iOS 15；SDK 不要求项目把原有链接改成平台固定路径。
 
 ```swift
